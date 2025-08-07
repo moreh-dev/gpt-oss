@@ -14,7 +14,7 @@ Its primary goal is educational—helping people understand the architecture and
 
 ### Model C++ Implementation (Owner: Duc)
 
-- [ ] Create `llama-4` repository (CPU baseline)
+- [ ] Inference GPT-OSS using CPU only
 - [ ] Implement tokenizer
 - [ ] Implement model loading
 - [ ] Implement forward pass
@@ -47,7 +47,7 @@ Its primary goal is educational—helping people understand the architecture and
     - [ ] Can be sent to worker nodes with `srun` command
     - [ ] Time limiation: 1 hour
     - [ ] Multi-nodes limitation: 1 node
-    - [ ] GPUs limitation: 4 GPUs
+    - [ ] GPUs limitation: 8 GPUs
     - [ ] 2 jobs can't use same GPU
     - [ ] 2 jobs from same user cannot be executed at the same time
     - [ ] Jobs from users with no jobs running have higher priority than jobs from users with jobs running. Slurm jobs queue has to loosen FIFO policy.
@@ -55,10 +55,12 @@ Its primary goal is educational—helping people understand the architecture and
     1. Plan A
         - [ ] 4 physical nodes serve as 4 Slurm worker nodes
         - [ ] Worker nodes can process multiple jobs at the same time
-        - [ ] User can define number of GPUs to be allocated (up to 4), default: 1
+        - [ ] User can define number of GPUs to be allocated (up to 8), default: 1
     2. Plan B (in case Plan A failed)
-        - [ ] 8 virtual nodes serve as 8 Slurm worker nodes
+        - [ ] 11 virtual nodes serve as 11 Slurm worker nodes
+            - [ ] 3 worker nodes have 8 inter-connected GPUs (type X worker node)
+            - [ ] 8 worker nodes have 1 GPU (type Y worker node)
+            - [ ] The number of type X and type Y worker node can be dynamically increased or decreased for workload balancing
         - [ ] Only one job can be processed by a worker node at a time
-        - [ ] Each worker node has 4 inter-connected GPUs
         - [ ] No GPU can be accessed by more than 1 worker node
 
