@@ -46,7 +46,7 @@ Its primary goal is educational—helping people understand the architecture and
 1. Slurm jobs
     - [ ] Can be sent to worker nodes with `srun` command
     - [ ] Time limiation: 1 hour
-    - [ ] Multi-nodes limitation: 2 nodes
+    - [ ] Multi-nodes limitation: 1 node
     - [ ] GPUs limitation: 4 GPUs
     - [ ] 2 jobs can't use same GPU
     - [ ] 2 jobs from same user cannot be executed at the same time
