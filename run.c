@@ -883,6 +883,8 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     free(prompt_tokens);
 }
 
+#include "getp_eval.inc"
+#include "getp_run.inc"
 
 // ----------------------------------------------------------------------------
 // CLI, include only if not testing
@@ -932,6 +934,8 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
+        else if (argv[i][1] == 'f') { input_filename = argv[i + 1]; }
+        else if (argv[i][1] == 'o') { output_filename = argv[i + 1]; }
         else { error_usage(); }
     }
 
@@ -959,6 +963,11 @@ int main(int argc, char *argv[]) {
         generate(&transformer, &tokenizer, &sampler, prompt, steps);
     } else if (strcmp(mode, "chat") == 0) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+    } else if (strcmp(mode, "getp") == 0) {
+        // Don't modify this parts for evaluation
+        // {
+        getp(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps);
+        // }
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();
