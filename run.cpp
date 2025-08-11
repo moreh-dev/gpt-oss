@@ -77,16 +77,16 @@ typedef struct {
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    s->x = calloc(p->dim, sizeof(float));
-    s->xb = calloc(p->dim, sizeof(float));
-    s->xb2 = calloc(p->dim, sizeof(float));
-    s->hb = calloc(p->hidden_dim, sizeof(float));
-    s->hb2 = calloc(p->hidden_dim, sizeof(float));
-    s->q = calloc(p->dim, sizeof(float));
-    s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-    s->logits = calloc(p->vocab_size, sizeof(float));
+    s->x = reinterpret_cast<float*>(calloc(p->dim, sizeof(float)));
+    s->xb = reinterpret_cast<float*>(calloc(p->dim, sizeof(float)));
+    s->xb2 = reinterpret_cast<float*>(calloc(p->dim, sizeof(float)));
+    s->hb = reinterpret_cast<float*>(calloc(p->hidden_dim, sizeof(float)));
+    s->hb2 = reinterpret_cast<float*>(calloc(p->hidden_dim, sizeof(float)));
+    s->q = reinterpret_cast<float*>(calloc(p->dim, sizeof(float)));
+    s->key_cache = reinterpret_cast<float*>(calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
+    s->value_cache = reinterpret_cast<float*>(calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
+    s->att = reinterpret_cast<float*>(calloc(p->n_heads * p->seq_len, sizeof(float)));
+    s->logits = reinterpret_cast<float*>(calloc(p->vocab_size, sizeof(float)));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
@@ -155,7 +155,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     // memory map the Transformer weights into the data pointer
     *fd = open(checkpoint, O_RDONLY); // open in read only mode
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+    *data = reinterpret_cast<float*>(mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0));
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
@@ -445,7 +445,7 @@ void safe_printf(char *piece) {
 int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     // efficiently find the perfect match for str in vocab, return its index or -1 if not found
     TokenIndex tok = { .str = str }; // acts as the key to search for
-    TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
+    TokenIndex *res = reinterpret_cast<TokenIndex*>(bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens));
     return res != NULL ? res->id : -1;
 }
 
@@ -456,7 +456,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 
     if (t->sorted_vocab == NULL) {
         // lazily malloc and sort the vocabulary
-        t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+        t->sorted_vocab = reinterpret_cast<TokenIndex*>(malloc(t->vocab_size * sizeof(TokenIndex)));
         for (int i = 0; i < t->vocab_size; i++) {
             t->sorted_vocab[i].str = t->vocab[i];
             t->sorted_vocab[i].id = i;
@@ -466,7 +466,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 
     // create a temporary buffer that will store merge candidates of always two consecutive tokens
     // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
-    char* str_buffer = malloc((t->max_token_length*2 +1 +2) * sizeof(char));
+    char* str_buffer = reinterpret_cast<char*>(malloc((t->max_token_length*2 +1 +2) * sizeof(char)));
     size_t str_len = 0;
 
     // start at 0 tokens
@@ -670,7 +670,7 @@ void build_sampler(Sampler* sampler, int vocab_size, float temperature, float to
     sampler->topp = topp;
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
-    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+    sampler->probindex = reinterpret_cast<ProbIndex*>(malloc(sampler->vocab_size * sizeof(ProbIndex)));
 }
 
 void free_sampler(Sampler* sampler) {
@@ -902,6 +902,8 @@ void error_usage() {
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+    fprintf(stderr, "  -f <string> (optional) input file in getp mode\n");
+    fprintf(stderr, "  -o <string> (optional) output file in getp mode\n");
     exit(EXIT_FAILURE);
 }
 
@@ -917,6 +919,8 @@ int main(int argc, char *argv[]) {
     unsigned long long rng_seed = 0; // seed rng with time by default
     char *mode = "generate";    // generate|chat
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
+    char *input_filename = NULL;
+    char *output_filename = NULL;
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }

@@ -1,5 +1,9 @@
 // DO NOT MODIFY THIS FILE
 
+#include <hip/hip_runtime.h>
+#include <iostream>
+#include <fstream>
+
 #ifndef GETP_EVAL
 #define GETP_EVAL
 
@@ -88,15 +92,15 @@ int write_outputfile(const char* output_filename, Requests* reqs) {
 }
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer, Requests* requests);
-void inference(Transformer* transformer, Tokenizer* tokenizer, Requests* requests);
+long long inference(Transformer* transformer, Tokenizer* tokenizer, Requests* requests);
 
 void getp(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char* input_filename, char* output_filename, int steps) {
   Requests requests;
   int num_reqs;
-  if (steps == 0 || steps > transformer.config.seq_len)
-    steps = transformer.config.seq_len;
+  if (steps == 0 || steps > transformer->config.seq_len)
+    steps = transformer->config.seq_len;
   if(input_filename == NULL || output_filename == NULL) {
-    error_usage();
+    exit(EXIT_FAILURE);
   }
   if(EXIT_FAILURE == read_inputfile(input_filename, tokenizer->max_token_length, steps, &requests)) {
     fprintf(stderr, "cannot read input file: %s\n", input_filename);
@@ -106,12 +110,12 @@ void getp(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
   long start, end;
 
   start = time_in_ms();
-  warm_up(&transformer, &tokenizer, &requests);
+  warm_up(transformer, tokenizer, &requests);
   end = time_in_ms();
   printf("warm up elapsed time(s): %f\n", (double)(end-start)/1000);
 
   start = time_in_ms();
-  int num_gen_tokens = inference(&transformer, &tokenizer, &requests);
+  int num_gen_tokens = inference(transformer, tokenizer, &requests);
   end = time_in_ms();
   // Your goal is to achieve best throughput(=reduce elapsed time)! 
   fprintf(stdout, "elapsed time(s): %f, achieved throughput TPS (tok/s): %f\n", (double)(end-start)/1000, (num_gen_tokens) / (double)(end-start)*1000);

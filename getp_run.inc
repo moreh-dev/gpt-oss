@@ -5,6 +5,6 @@ void warm_up(Transformer* transformer, Tokenizer* tokenizer, Requests* requests)
 
 }
 
-void inference(Transformer* transformer, Tokenizer* tokenizer, Requests* requests) {
-
+long long inference(Transformer* transformer, Tokenizer* tokenizer, Requests* requests) {
+    return 0;
 }
