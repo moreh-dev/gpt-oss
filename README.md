@@ -12,24 +12,30 @@ Its primary goal is educational—helping people understand the architecture and
 
 ## TODOs
 
+Update Checkpoint: 11 Aug 2025
+
 ### Model C++ Implementation (Owner: Duc)
 
-- [ ] Inference GPT-OSS using CPU only
-- [ ] Implement tokenizer
-- [ ] Implement model loading
-- [ ] Implement forward pass
-- [ ] Add logging and debugging utilities
+- [ ] Inference GPT-OSS using CPU only: on going
+- [ ] Implement tokenizer: on going
+- [x] Implement model loading
+- [ ] Implement forward pass: on going
 
 ### Accuracy Evaluation (Owner: Tung)
 
-- [ ] Decide evaluation metric (BLEU, MMLU, etc.)
-- [ ] Build evaluation scripts
-- [ ] Compare with baseline models
+- [x] Decide evaluation metric (BLEU, MMLU, etc.)
+- [x] Build evaluation scripts
+- [x] Compare with baseline models
+- [ ] Make Slide for Output Norm: TODO
+- [ ] Make Common Slide: TODO
 
 ### Performance Evaluation (Owner: Long)
 
-- [ ] Define threshold criteria
-- [ ] Report throughput and latency metrics
+- [ ] Define threshold criteria: on going
+- [x] Report throughput and latency metrics
+- [ ] Add logging and debugging utilities: optional
+- [ ] Create reference outputs for gpt-oss-20b for 128 prompts: TODO
+- [ ] Create reference outputs for gpt-oss-120b for 128 prompts: TODO
 
 ### Server Configuration Requirements (Owner: Huy)
 
@@ -45,7 +51,7 @@ Its primary goal is educational—helping people understand the architecture and
     - [ ] User guide document
 1. Slurm jobs
     - [ ] Can be sent to worker nodes with `srun` command
-    - [ ] Time limiation: 1 hour
+    - [ ] Time limitation: 1 hour
     - [ ] Multi-nodes limitation: 1 node
     - [ ] GPUs limitation: 8 GPUs
     - [ ] 2 jobs can't use same GPU
@@ -63,4 +69,3 @@ Its primary goal is educational—helping people understand the architecture and
             - [ ] The number of type X and type Y worker node can be dynamically increased or decreased for workload balancing
         - [ ] Only one job can be processed by a worker node at a time
         - [ ] No GPU can be accessed by more than 1 worker node
-
