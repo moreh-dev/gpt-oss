@@ -56,7 +56,7 @@ Update Checkpoint: 11 Aug 2025
     - [ ] GPUs limitation: 8 GPUs
     - [ ] 2 jobs can't use same GPU
     - [ ] 2 jobs from same user cannot be executed at the same time
-    - [ ] Jobs from users with no jobs running have higher priority than jobs from users with jobs running. Slurm jobs queue has to loosen FIFO policy.
+    - [ ] Jobs from users with no jobs running have higher priority than jobs from users with jobs running. Slurm jobs queue has to loosen FIFO policy: TODO until end project.
 1. Slurm worker nodes
     1. Plan A
         - [ ] 4 physical nodes serve as 4 Slurm worker nodes
