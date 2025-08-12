@@ -40,11 +40,11 @@ typedef struct {
 	float *rms_attn_w;				// (n_layers, hidden_dim) [attn.norm.scale]
 	float *rms_ffn_w;				// (n_layers, hidden_dim) [mlp.norm.scale]
 	// weights for attention [attn.qkv.weight & attn.qkv.bias]
-	float *w_qkv;					// (n_layers, hidden_dim, head_dim * n_attn_heads + 2 * head_dim * n_kv_heads) where
-									// w_q (hidden_dim, head_dim * n_attn_heads)
-									// w_k (hidden_dim, head_dim * n_kv_heads)
-									// w_v (hidden_dim, head_dim * n_kv_heads)
-	float *w_o;						// (n_layers, head_dim * n_attn_heads, hidden_dim)
+	float *w_qkv;					// (n_layers, head_dim * n_attn_heads + 2 * head_dim * n_kv_heads, hidden_dim) where
+									// w_q (head_dim * n_attn_heads, hidden_dim) (out_features, in_features)
+									// w_k (head_dim * n_kv_heads, hidden_dim)  (out_features, in_features)
+									// w_v (head_dim * n_kv_heads, hidden_dim)  (out_features, in_features)
+	float *w_o;						// (n_layers, hidden_dim, head_dim * n_attn_heads)
 	float *b_qkv;					// (n_layers, head_dim * n_attn_heads + 2 * head_dim * n_kv_heads)
 									// (head_dim * n_attn_heads)
 									// (head_dim * n_kv_heads)
@@ -145,8 +145,7 @@ void memory_map_weights(TransformerWeights *w, Config *cfg, float *ptr) {
 	ptr += cfg->hidden_dim;
 	// hey it's qkvqkv, not qqkkvv
 	w->w_qkv = ptr;
-	ptr += n_layers * cfg->hidden_dim * (head_dim * cfg->n_attn_heads +
-											  2 * head_dim * cfg->n_kv_heads);
+	ptr += n_layers * cfg->hidden_dim * (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
 	w->b_qkv = ptr;
 	ptr += n_layers * (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
 	w->w_o = ptr;
@@ -170,7 +169,7 @@ void memory_map_weights(TransformerWeights *w, Config *cfg, float *ptr) {
 	ptr += n_layers * cfg->hidden_dim * cfg->intermediate_dim;
 }
 
-void load_checkpoint(char *ckpt, Config *config, TransformerWeights *weights, int *fd, float **data, ssize_t *file_size) {
+void load_checkpoint(char* ckpt, Config *config, TransformerWeights *weights, int *fd, float **data, ssize_t *file_size) {
 	FILE *file = fopen(ckpt, "rb");
 	if (!file) { fprintf(stderr, "Couldn't open file %s\n", ckpt); exit(EXIT_FAILURE); }
 
@@ -243,7 +242,8 @@ void softmax(float* x, int size) {
 }
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
+	// n := in_features, d := out_features
+    // W (out,in) @ x (in,) -> xout (out,)
     // by far the most amount of time is spent inside this little function
     int i;
     #pragma omp parallel for private(i)
@@ -254,14 +254,6 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
         }
         xout[i] = val;
     }
-}
-
-void transpose(float* x_T, float *x, size_t n_row, size_t n_col) {
-	for (size_t r = 0; r < n_row; r++) {
-		for (size_t c = 0; c < n_col; c++) {
-			x_T[c * n_row + r] = x[r * n_col + c];
-		}
-	}
 }
 
 // Pair struct to store score and original index
@@ -323,16 +315,30 @@ float* forward(Transformer *transformer, int token, int pos) {
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
         s->k = s->key_cache + loff + pos * kv_dim;
         s->v = s->value_cache + loff + pos * kv_dim;
-		// Separate q, k, v
-		float *w_qkv = w->w_qkv + l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-		float *w_q = w_qkv;
-		float *w_k = w_qkv + hidden_dim * (head_dim * p->n_attn_heads);
-		float *w_v = w_qkv + hidden_dim * (head_dim * p->n_attn_heads) + hidden_dim * (head_dim * p->n_kv_heads);
+		// Separate w_q, w_k, w_v
+		float *w_qkv = w->w_qkv + l * hidden_dim * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+		float *w_q = w_qkv; // (head_dim * n_attn_heads, hidden_dim)
+		float *w_k = w_qkv + hidden_dim * (head_dim * p->n_attn_heads); // (head_dim * n_kv_heads, hidden_dim)
+		float *w_v = w_qkv + hidden_dim * (head_dim * p->n_attn_heads) + hidden_dim * (head_dim * p->n_kv_heads); // (head_dim * n_kv_heads, hidden_dim)
+		// Separate b_q, b_k, b_v
+		float *b_qkv = w->b_qkv + l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+		float *b_q = b_qkv;
+		float *b_k = b_qkv + (head_dim * p->n_attn_heads);
+		float *b_v = b_qkv + (head_dim * p->n_attn_heads) + (head_dim * p->n_kv_heads);
 
         // qkv matmuls for this position
         matmul(s->q, s->xb, w_q, hidden_dim, head_dim * p->n_attn_heads);
+		for (int i = 0; i < head_dim * p->n_attn_heads; i++) {
+			s->q[i] += b_q[i];
+		}
         matmul(s->k, s->xb, w_k, hidden_dim, head_dim * p->n_kv_heads);
+		for (int i = 0; i < head_dim * p->n_kv_heads; i++) {
+			s->k[i] += b_k[i];
+		}
         matmul(s->v, s->xb, w_v, hidden_dim, head_dim * p->n_kv_heads);
+		for (int i = 0; i < head_dim * p->n_kv_heads; i++) {
+			s->v[i] += b_v[i];
+		}
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < head_dim * p->n_attn_heads; i+=2) {
@@ -351,7 +357,6 @@ float* forward(Transformer *transformer, int token, int pos) {
             }
         }
 		
-		// TODO: integrate bias and sink
         // multihead attention. iterate over all heads
         int h;
         #pragma omp parallel for private(h)
@@ -402,7 +407,7 @@ float* forward(Transformer *transformer, int token, int pos) {
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_w + l * hidden_dim, hidden_dim);
 
-		// TODO: MoE
+		// MoE
 		// Compute router_score
 		matmul(s->router_score, s->xb, w->w_router + l*hidden_dim*n_experts, hidden_dim, p->n_experts); // s->router_score now stores router_score (num_experts, )
 		// Select top-k experts
@@ -414,38 +419,38 @@ float* forward(Transformer *transformer, int token, int pos) {
 		float *e_agg = (float*)calloc(hidden_dim, sizeof(float));
 		if (!e_agg) { fprintf(stderr, "Failed init e_agg\n"); exit(EXIT_FAILURE); }
 		for (int e = 0; e < n_experts; e++) {
+			float expert_w = 0;
 			int in_topk = 0;
 			// Check if expert i is in top-k experts
 			for (int idx = 0; idx < p->experts_per_token; idx++) {
 				if (s->topk_i[idx] == e) {
 					in_topk = 1;
-					float expert_w = s->topk_v[idx];
+					expert_w = s->topk_v[idx];
 					break;
 				}
 			}
 
 			if (in_topk) {
-				float *block_ptr = w->w_mlp1 + ((l * n_experts + e) * 2 * p->intermediate_dim + hidden_dim);
-				float *w_gate = block_ptr;
-				float *w_up = block_ptr + p->intermediate_dim * hidden_dim;
-				float *w_gate_T, *w_up_T, *gate, *up, *gate_up;
-				transpose(w_gate_T, w_gate, p->intermediate_dim, hidden_dim);
-				transpose(w_up_T, w_up, p->intermediate_dim, hidden_dim);
-				matmul(gate, s->xb, w_gate_T, hidden_dim, p->intermediate_dim); // (intermediate_dim, )
-				matmul(up, s->xb, w_up_T, hidden_dim, p->intermediate_dim); // (intermediate_dim, )
+				float *block_ptr = w->w_mlp1 + ((l * n_experts + e) * (2 * p->intermediate_dim) * hidden_dim);
+				float *w_gate = block_ptr; // (intermediate_dim, hidden_dim)
+				float *w_up = block_ptr + p->intermediate_dim * hidden_dim; // (intermediate_dim, hidden_dim)
+				float *gate, *up, *gate_up;
+				matmul(gate, s->xb, w_gate, hidden_dim, p->intermediate_dim); // (intermediate_dim, )
+				matmul(up, s->xb, w_up, hidden_dim, p->intermediate_dim); // (intermediate_dim, )
 
 				// SwiGLU non-linearity
 				for (int i = 0; i < p->intermediate_dim; i++) {
 					float val = gate[i];
 					// silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
 					val *= (1.0f / (1.0f + expf(-val)));
-					// elementwise multiply with w3(x)
+					// elementwise multiply with w_gate(x)
 					val *= up[i];
 					gate_up[i] = val;
 				}
 				
 				// final matmul to get the output of the ffn
-				matmul(s->xb, gate_up, w->w_mlp2 + , p->intermediate_dim, hidden_dim); // (hidden_dim, )
+				float *w_down = w->w_mlp2 + (l * n_experts + e) * hidden_dim * p->intermediate_dim; // (out: hidden_dim, in: intermediate_dim)
+				matmul(s->xb, gate_up, w_down, p->intermediate_dim, hidden_dim); // (hidden_dim, )
 
 				// aggregate topk experts using weighted sum 
 				for (int i = 0; i < hidden_dim; i++) {
@@ -454,7 +459,11 @@ float* forward(Transformer *transformer, int token, int pos) {
 			}
 		}
 
-		//
+		// residual connection
+		for (int i = 0; i < hidden_dim; i++) {
+			x[i] += e_agg[i];
+		}
+		
 	}
 	// final rmsnorm
 	rmsnorm(x, x, w->rms_out_w, hidden_dim);
