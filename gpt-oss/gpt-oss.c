@@ -910,20 +910,7 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
 
 typedef struct {
   int vocab_size;
-  float temperature;
-  float topp;
-  unsigned long long rng_state;
 } Sampler;
-
-static unsigned int rng_u32(unsigned long long *state) {
-  *state ^= *state >> 12;
-  *state ^= *state << 25;
-  *state ^= *state >> 27;
-  return (unsigned int)((*state * 0x2545F4914F6CDD1Dull) >> 32);
-}
-static float rng_f32(unsigned long long *state) {
-  return (rng_u32(state) >> 8) / 16777216.0f;
-}
 
 static int sample_argmax(const float *p, int n) {
   int mi = 0;
@@ -936,92 +923,9 @@ static int sample_argmax(const float *p, int n) {
   return mi;
 }
 
-typedef struct {
-  float prob;
-  int idx;
-} ProbIndex;
-static int cmp_prob_desc(const void *a, const void *b) {
-  float da = ((const ProbIndex *)a)->prob;
-  float db = ((const ProbIndex *)b)->prob;
-  return (da < db) - (da > db);
-}
-
-static int sample_topp(float *logits, int V, float topp,
-                       unsigned long long *st) {
-  // transform to probs (softmax)
-  float mx = logits[0];
-  for (int i = 1; i < V; i++)
-    if (logits[i] > mx)
-      mx = logits[i];
-  float sum = 0.0f;
-  for (int i = 0; i < V; i++) {
-    logits[i] = expf(logits[i] - mx);
-    sum += logits[i];
-  }
-  for (int i = 0; i < V; i++)
-    logits[i] /= sum;
-
-  // crop by cutoff to reduce sort cost
-  float cutoff = (1.0f - topp) / (V - 1);
-  ProbIndex *arr = (ProbIndex *)malloc(sizeof(ProbIndex) * V);
-  int n0 = 0;
-  for (int i = 0; i < V; i++)
-    if (logits[i] >= cutoff) {
-      arr[n0].prob = logits[i];
-      arr[n0].idx = i;
-      n0++;
-    }
-  qsort(arr, n0, sizeof(ProbIndex), cmp_prob_desc);
-
-  float csum = 0.0f;
-  int last = n0 - 1;
-  for (int i = 0; i < n0; i++) {
-    csum += arr[i].prob;
-    if (csum > topp) {
-      last = i;
-      break;
-    }
-  }
-  float r = rng_f32(st) * csum, cdf = 0.0f;
-  int out = arr[last].idx;
-  for (int i = 0; i <= last; i++) {
-    cdf += arr[i].prob;
-    if (r < cdf) {
-      out = arr[i].idx;
-      break;
-    }
-  }
-  free(arr);
-  return out;
-}
-
 static int sample_next(Sampler *s, float *logits) {
-  int V = s->vocab_size;
-  if (s->temperature <= 1e-8f && (s->topp <= 0.0f || s->topp >= 1.0f))
-    return sample_argmax(logits, V);
-  if (s->temperature > 0.0f) {
-    for (int i = 0; i < V; i++)
-      logits[i] /= s->temperature;
-  }
-  if (s->topp > 0.0f && s->topp < 1.0f)
-    return sample_topp(logits, V, s->topp, &s->rng_state);
-  // multinomial over full softmax
-  float mx = logits[0];
-  for (int i = 1; i < V; i++)
-    if (logits[i] > mx)
-      mx = logits[i];
-  float sum = 0.0f;
-  for (int i = 0; i < V; i++) {
-    logits[i] = expf(logits[i] - mx);
-    sum += logits[i];
-  }
-  float r = rng_f32(&s->rng_state) * sum, c = 0.0f;
-  for (int i = 0; i < V; i++) {
-    c += logits[i];
-    if (c >= r)
-      return i;
-  }
-  return V - 1;
+  // Only greedy decoding: always pick argmax
+  return sample_argmax(logits, s->vocab_size);
 }
 
 // -------------------------------
@@ -1031,7 +935,7 @@ static int sample_next(Sampler *s, float *logits) {
 
 static void usage() {
   fprintf(stderr, "Usage: gpt-oss <checkpoint.bin> -i \"prompt\" -n <steps> "
-                  "[-t tokenizer.bin] [-T <temp>] [-P <topp>] [-s <seed>]\n");
+                  "[-t tokenizer.bin]\n");
   exit(1);
 }
 
@@ -1042,9 +946,7 @@ int main(int argc, char **argv) {
   const char *prompt = "Hello";
   const char *tokpath = "tokenizer.bin";
   int steps = 64;
-  float temp = 0.0f; // greedy by default
-  float topp = 1.0f; // off by default
-  unsigned long long seed = (unsigned)time(NULL);
+  // Only greedy decoding supported
 
   for (int i = 2; i < argc; i++) {
     if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
@@ -1057,18 +959,6 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
       tokpath = argv[++i];
-      continue;
-    }
-    if (strcmp(argv[i], "-T") == 0 && i + 1 < argc) {
-      temp = (float)atof(argv[++i]);
-      continue;
-    }
-    if (strcmp(argv[i], "-P") == 0 && i + 1 < argc) {
-      topp = (float)atof(argv[++i]);
-      continue;
-    }
-    if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
-      seed = (unsigned long long)strtoull(argv[++i], NULL, 10);
       continue;
     }
     fprintf(stderr, "Unknown arg: %s\n", argv[i]);
@@ -1104,10 +994,7 @@ int main(int argc, char **argv) {
   }
 
   // Sampler
-  Sampler sampler = {.vocab_size = model.config.vocab_size,
-                     .temperature = temp,
-                     .topp = topp,
-                     .rng_state = seed};
+  Sampler sampler = {.vocab_size = model.config.vocab_size};
 
   // ---- KV warmup: run the ENTIRE prompt through the model WITHOUT printing
   int pos = 0;
