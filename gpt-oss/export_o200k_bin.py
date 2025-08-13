@@ -164,6 +164,13 @@ def main() -> None:
 
     try:
         enc = tiktoken.get_encoding(args.encoding)
+        for name in [
+                "<|start|>", "<|end|>", "<|return|>", "<|message|>",
+                "<|channel|>", "<|constrain|>", "<|endoftext|>"
+        ]:
+            tid = enc._special_tokens.get(name)
+            if tid is not None:
+                print(f"{name}: {tid}")
     except Exception as e:
         print(f"[ERROR] Unknown encoding '{args.encoding}': {e}",
               file=sys.stderr)

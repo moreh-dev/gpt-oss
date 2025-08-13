@@ -1085,17 +1085,14 @@ int main(int argc, char **argv) {
   Tokenizer tokenizer;
   read_tokenizer(&tokenizer, tokpath, model.config.vocab_size);
 
-  // Try to discover special tokens in the vocab (o200k)
-  int BOS = find_token_id(&tokenizer, "<|begin_of_text|>",
-                          (int)strlen("<|begin_of_text|>"));
-  if (BOS < 0)
-    BOS = find_token_id(&tokenizer, "<|beginoftext|>",
-                        (int)strlen("<|beginoftext|>"));
-  int EOS = find_token_id(&tokenizer, "<|end_of_text|>",
-                          (int)strlen("<|end_of_text|>"));
-  if (EOS < 0)
-    EOS = find_token_id(&tokenizer, "<|endoftext|>",
-                        (int)strlen("<|endoftext|>"));
+  // Discover special tokens in the vocab (o200k)
+  int BOS = find_token_id(&tokenizer, "<|start|>", (int)strlen("<|start|>"));
+  int EOS = find_token_id(&tokenizer, "<|return|>", (int)strlen("<|return|>"));
+  // BOS = <|start|> (200006)
+  // EOS = <|end|> (200007) for per-message, or <|return|> (200002) for
+  // end-of-completion.
+  printf("BOS token id: %d\n", BOS);
+  printf("EOS token id: %d\n", EOS);
 
   // Encode prompt (only add BOS if we actually found it; don't auto-append EOS)
   int *tokens = (int *)malloc(sizeof(int) * (model.config.seq_len));
