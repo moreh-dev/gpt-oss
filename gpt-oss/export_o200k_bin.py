@@ -69,35 +69,30 @@ def main():
         if r is not None:
             scores[tid] = -float(r)
 
-    # Prepare string forms for each token. For raw byte tokens (single byte), use "<0x%02X>"
-    token_strs = []
-    max_str_len = 0
-    for tid, b in enumerate(token_bytes):
-        if len(b) == 1:
-            s = f"<0x{b[0]:02X}>"
+    # Prepare BYTES for each token. We store literal bytes so the C BPE can
+    # concatenate and look them up. Only special-case the null byte (0x00),
+    # which cannot appear inside a C string (strcmp stops at NUL).
+    token_bytes_out = []
+    max_len = 0
+    for b in token_bytes:
+        if len(b) == 1 and b[0] == 0x00:
+            s_bytes = b"<0x00>"  # safe C-string stand-in
         else:
-            try:
-                s = b.decode("utf-8")
-            except UnicodeDecodeError:
-                # Fallback: hex-escape all bytes if not valid UTF-8
-                s = "".join(
-                    chr(x) if 32 <= x <= 126 else f"\\x{x:02x}" for x in b)
-        token_strs.append(s)
-        if len(s) > max_str_len:
-            max_str_len = len(s)
+            s_bytes = b  # literal bytes for everything else
+        token_bytes_out.append(s_bytes)
+        if len(s_bytes) > max_len:
+            max_len = len(s_bytes)
 
     with args.out.open("wb") as f:
-        # write max_token_length
-        f.write(struct.pack("i", max_str_len))
-        # then for each token: float score, int len, bytes
-        for tid, s in enumerate(token_strs):
+        # write max_token_length (in BYTES)
+        f.write(struct.pack("i", max_len))
+        # then for each token: float score, int len, raw bytes
+        for tid, s_bytes in enumerate(token_bytes_out):
             f.write(struct.pack("f", scores[tid]))
-            s_bytes = s.encode("utf-8")
             f.write(struct.pack("i", len(s_bytes)))
             f.write(s_bytes)
-
     print(
-        f"Wrote tokenizer with {n_vocab} tokens to {args.out} (max_token_length={max_str_len})"
+        f"Wrote tokenizer with {n_vocab} tokens to {args.out} (max_token_length={max_len})"
     )
 
 
