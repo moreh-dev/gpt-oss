@@ -286,13 +286,6 @@ static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
 
   int merge_step = 0;
   while (1) {
-    // Print current tokens and pieces before each merge
-    fprintf(stderr, "[BPE step %d] tokens:", merge_step);
-    for (int i = 0; i < ntok; i++) {
-      fprintf(stderr, " %d('%s')", tokens[i], pieces[i]);
-    }
-    fprintf(stderr, "\n");
-
     float best_score = 1e30f; // Use lowest score (rank) for BPE merges
     int best_idx = -1;
     int best_id = -1;
@@ -314,8 +307,6 @@ static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
 
       int id = find_token_id(t, cat, lsum);
       float score = (id >= 0) ? t->scores[id] : 0.0f;
-      // Print attempted merge
-      fprintf(stderr, "  Try merge [%d] '%s' + [%d] '%s' => id=%d score=%g\n", tokens[i], a, tokens[i+1], b, id, score);
       free(cat);
 
       // Skip if not found or is a special token (very negative score)
@@ -333,13 +324,8 @@ static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
       // Tie-break: leftmost (already handled by <)
     }
 
-    if (best_idx == -1) {
-      fprintf(stderr, "[BPE step %d] No more merges.\n", merge_step);
+    if (best_idx == -1)
       break;
-    }
-
-    // Print chosen merge
-    fprintf(stderr, "[BPE step %d] MERGE [%d] '%s' + [%d] '%s' => id=%d ('%s') score=%g\n", merge_step, tokens[best_idx], pieces[best_idx], tokens[best_idx+1], pieces[best_idx+1], best_id, t->vocab[best_id], best_score);
 
     // commit the best merge: replace pair (best_idx, best_idx+1) with best_id
     tokens[best_idx] = best_id;
