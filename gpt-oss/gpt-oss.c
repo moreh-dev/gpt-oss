@@ -1,23 +1,32 @@
+// gpt-oss.c — Minimal CPU-only GPT-OSS inference (single process)
+// Build:   cc -O3 -march=native -o gpt-oss gpt-oss.c -lm
+// Run:     ./gpt-oss gpt-oss-20b.bin -i "Hello" -n 64 -t tokenizer.bin
+//
+// Notes:
+//  - Inputs rely on a custom .bin created by your exporter to match the layout
+//  below.
+//  - Tokenization uses your existing tokenizer.{c,h} (o200k_harmony).
+//  - This is a didactic, correctness-first implementation (no threading/AVX).
+//
+// Features:
+//  - Grouped-Query Attention (n_heads, n_kv_heads)
+//  - Alternating dense vs. sliding-window attention (configurable via
+//  alt_banded/window)
+//  - Learned attention-sink term (adds an extra column to the softmax
+//  denominator only)
+//  - RoPE with YaRN-style scaling
+//  - MoE FFN (top-k) with SwiGLU (+ clamp) and +1 bias on the linear (gate)
+//  branch
+//  - Greedy sampling (argmax)
+//
+// Header contract (binary):
+//  - File starts with a GPTOSSConfig struct (fixed-size, little-endian).
+//  - Followed by all weights as contiguous float32 in the order mapped in
+//  memory_map_weights().
+//  - If vocab_size in header is negative => output head tied to embeddings
+//  (|vocab_size| is true size).
+
 #include "tokenizer.h"
-/* Minimal GPT-OSS inference (single-node, CPU, pure C)
- *
- * Features implemented:
- *  - GQA attention (n_heads, n_kv_heads)
- *  - Alternating banded (sliding-window) and dense attention layers
- *  - RoPE with configurable scaling (placeholder for YaRN)
- *  - MoE FFN with top-K routing (default K=4)
- *  - Optional projection biases (GPT-OSS uses biases)
- *  - Tokenizer loader & BPE-like encode/"safe" decode (Karpathy
- * llama2.c-compatible tokenizer.bin)
- *  - Temperature + top-p sampling
- *
- * Run (after packing weights & exporting tokenizer.bin):
- *   ./gpt-oss gpt-oss-20b.bin -i "Hello, world" -n 64
- *
- * TODOs:
- *  - MXFP4 expert weights: decode on load or preconvert to fp16/fp32.
- *  - Fast paths: precomputed sin/cos for RoPE, vectorization, kv cache layout.
- */
 
 #include <ctype.h>
 #include <errno.h>
@@ -32,65 +41,69 @@
 #include <unistd.h>
 
 // -------------------------------
-// Model config (matches checkpoint header)
+// Model config (must match exporter)
 
 typedef struct {
-  int dim;          // residual dim
-  int hidden_dim;   // FFN hidden dim per expert
-  int n_layers;     // transformer layers
-  int n_heads;      // query heads
-  int n_kv_heads;   // KV heads (GQA)
-  int n_experts;    // experts per layer (e.g., 128 for 120B, 32 for 20B)
-  int top_k;        // router top-k (default 4)
-  int vocab_size;   // tokenizer vocab (o200k_harmony = ~201088); if <0 => tied
-  int seq_len;      // max sequence length supported by checkpoint
-  int window;       // sliding window size for banded attention (e.g., 128)
-  int alt_banded;   // if 1, layers alternate banded/dense starting at 0
-  float rope_base;  // RoPE base theta (default 10000.0f)
-  float rope_scale; // RoPE scaling (placeholder for YaRN)
+  int dim;         // residual dimension (model width)
+  int hidden_dim;  // MoE expert hidden dimension (per expert)
+  int n_layers;    // transformer depth
+  int n_heads;     // number of Q heads
+  int n_kv_heads;  // number of KV heads (GQA)
+  int n_experts;   // experts per layer (e.g., 32 for 20B, 128 for 120B)
+  int top_k;       // router top-k (usually 4)
+  int vocab_size;  // tokenizer vocab; negative => tied output head
+  int seq_len;     // max sequence length in checkpoint
+  int window;      // sliding window size (e.g., 128); 0 => fully dense
+  int alt_banded;  // 0=dense only, +1=even banded, -1=odd banded, +2=all banded
+  float rope_base; // RoPE theta (e.g., 150000.0)
+  float rope_scale;     // YaRN scaling factor (>0)
+  float rope_ntk_alpha; // optional (kept for completeness)
+  float rope_ntk_beta;  // optional (kept for completeness)
+  float swiglu_limit;   // clamp for pre-activations (e.g., 7.0)
 } GPTOSSConfig;
 
 // -------------------------------
-// Weights layout
+// Weights layout (contiguous floats)
 
 typedef struct {
   // token embedding
   float *tok_embeddings; // (vocab_size, dim)
 
-  // per-layer RMSNorm weights
-  float *rms_att_w; // (layer, dim)
-  float *rms_ffn_w; // (layer, dim)
+  // per-layer rmsnorm weights
+  float *rms_att_w; // (n_layers, dim)
+  float *rms_ffn_w; // (n_layers, dim)
 
   // attention projections (with biases)
-  float *wq; // (layer, dim, dim)
-  float *wk; // (layer, dim, kv_dim)
-  float *wv; // (layer, dim, kv_dim)
-  float *wo; // (layer, dim, dim)  [note: stored as (out, in)]
-  float *bq; // (layer, dim)
-  float *bk; // (layer, kv_dim)
-  float *bv; // (layer, kv_dim)
+  float *wq; // (n_layers, dim, dim)
+  float *wk; // (n_layers, dim, kv_dim)
+  float *wv; // (n_layers, dim, kv_dim)
+  float *wo; // (n_layers, dim, dim)  [stored row-major as (out, in)]
+  float *bq; // (n_layers, dim)
+  float *bk; // (n_layers, kv_dim)
+  float *bv; // (n_layers, kv_dim)
+  float *bo; // (n_layers, dim)
 
-  float *bo; // (layer, dim)
+  // learned attention-sink bias (denominator-only), per head
+  float *attn_sink; // (n_layers, n_heads)
 
-  // learned attention sink bias (per layer, per head): added to softmax denom
-  float *attn_sink; // (layer, n_heads)
+  // MoE router affine (logits over experts)
+  float *wr; // (n_layers, n_experts, dim)
+  float *br; // (n_layers, n_experts)
 
-  // MoE router (linear + bias): logits over experts
-  float *wr; // (layer, n_experts, dim)
-  float *br; // (layer, n_experts)
+  // MoE experts (SwiGLU)
+  // W_up:   (hidden, dim)  ; b_up:   (hidden)
+  // W_gate: (hidden, dim)  ; b_gate: (hidden)
+  // W_down: (dim, hidden)  ; b_down: (dim)
+  float *w_up;   // (n_layers, n_experts, hidden, dim)
+  float *w_gate; // (n_layers, n_experts, hidden, dim)
+  float *w_down; // (n_layers, n_experts, dim, hidden)
+  float *b_up;   // (n_layers, n_experts, hidden)
+  float *b_gate; // (n_layers, n_experts, hidden)
+  float *b_down; // (n_layers, n_experts, dim)
 
-  // MoE experts: per-expert up/gate/down (SwiGLU variant)
-  // W_up: (hidden, dim), W_gate: (hidden, dim), W_down: (dim, hidden)
-  float *w_up;   // (layer, expert, hidden, dim)
-  float *w_gate; // (layer, expert, hidden, dim)
-  float *w_down; // (layer, expert, dim, hidden)
-  float *b_up;   // (layer, expert, hidden)
-  float *b_gate; // (layer, expert, hidden)
-  float *b_down; // (layer, expert, dim)
-
-  // final RMSNorm and LM head
+  // final norm + LM head
   float *rms_final_w; // (dim)
-  float *wcls;        // (vocab_size, dim) or shared with embeddings
+  float *wcls;        // (vocab_size, dim) or tied to tok_embeddings
 } GPTOSSWeights;
 
 // -------------------------------
@@ -108,26 +121,27 @@ typedef struct {
   float *hb;  // (hidden_dim)
   float *hb2; // (hidden_dim)
 
-  float *att;    // (n_heads * seq_len)
+  float *att;    // (n_heads * seq_len) scratch for attention probabilities
   float *logits; // (vocab_size)
 
-  // KV cache: (layer, seq_len, kv_dim)
+  // KV cache: (n_layers, seq_len, kv_dim)
   float *key_cache;
   float *val_cache;
 
   // router scratch
   float *router;      // (n_experts)
   int *topk_idx;      // (top_k)
-  float *topk_weight; // (top_k) softmax weights
+  float *topk_weight; // (top_k) softmax over top-k
 } RunState;
 
 // -------------------------------
-// Full model holder
+// Model holder
 
 typedef struct {
   GPTOSSConfig config;
   GPTOSSWeights weights;
   RunState state;
+
   // mmap housekeeping
   int fd;
   float *data;
@@ -135,16 +149,16 @@ typedef struct {
 } GPTOSSModel;
 
 // -------------------------------
-// Math helpers
+// Helpers
 
-static inline void rmsnorm(float *o, const float *x, const float *w, int size) {
+static inline void rmsnorm(float *restrict o, const float *restrict x,
+                           const float *restrict w, int size) {
   float ss = 0.0f;
   for (int j = 0; j < size; j++)
     ss += x[j] * x[j];
-  float denom = ss / size + 1e-5f;
-  ss = 1.0f / sqrtf(denom);
+  float inv = 1.0f / sqrtf(ss / (float)size + 1e-5f);
   for (int j = 0; j < size; j++)
-    o[j] = w[j] * (ss * x[j]);
+    o[j] = w[j] * (inv * x[j]);
 }
 
 static inline void softmax_inplace(float *x, int n) {
@@ -162,13 +176,14 @@ static inline void softmax_inplace(float *x, int n) {
     x[i] *= inv;
 }
 
-static inline void matmul(float *y, const float *x, const float *w, int n,
-                          int d) {
+static inline void matmul(float *restrict y, const float *restrict x,
+                          const float *restrict w, int n, int d) {
   // y(d) = W(d,n) @ x(n)
   for (int i = 0; i < d; i++) {
     float sum = 0.0f;
+    const float *restrict wi = w + (size_t)i * n;
     for (int j = 0; j < n; j++)
-      sum += w[i * n + j] * x[j];
+      sum += wi[j] * x[j];
     y[i] = sum;
   }
 }
@@ -180,7 +195,7 @@ static inline void topk_indices(const float *x, int n, int k, int *idx,
     val[i] = -1e30f;
   }
   for (int i = 0; i < n; i++) {
-    float v = x[i];
+    const float v = x[i];
     int pos = -1;
     for (int j = 0; j < k; j++)
       if (v > val[j]) {
@@ -202,25 +217,31 @@ static inline void topk_indices(const float *x, int n, int k, int *idx,
 // Memory management
 
 static void malloc_run_state(RunState *s, const GPTOSSConfig *p) {
-  int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+  const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+
   s->x = (float *)calloc(p->dim, sizeof(float));
   s->xb = (float *)calloc(p->dim, sizeof(float));
   s->xb2 = (float *)calloc(p->dim, sizeof(float));
   s->q = (float *)calloc(p->dim, sizeof(float));
   s->k = (float *)calloc(kv_dim, sizeof(float));
   s->v = (float *)calloc(kv_dim, sizeof(float));
+
   s->hb = (float *)calloc(p->hidden_dim, sizeof(float));
   s->hb2 = (float *)calloc(p->hidden_dim, sizeof(float));
+
   s->att = (float *)calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
   s->logits = (float *)calloc(p->vocab_size, sizeof(float));
+
   s->key_cache =
       (float *)calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
   s->val_cache =
       (float *)calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
+
   s->router =
       (float *)calloc(p->n_experts > 0 ? p->n_experts : 1, sizeof(float));
   s->topk_idx = (int *)calloc(p->top_k > 0 ? p->top_k : 1, sizeof(int));
   s->topk_weight = (float *)calloc(p->top_k > 0 ? p->top_k : 1, sizeof(float));
+
   if (!s->x || !s->xb || !s->xb2 || !s->q || !s->k || !s->v || !s->hb ||
       !s->hb2 || !s->att || !s->logits || !s->key_cache || !s->val_cache ||
       !s->router || !s->topk_idx || !s->topk_weight) {
@@ -247,16 +268,17 @@ static void free_run_state(RunState *s) {
   free(s->topk_weight);
 }
 
-// Map weights from a single contiguous float* buffer. See README for pack
+// Map weights from a single contiguous float* buffer. See exporter for packing
 // order.
 static void memory_map_weights(GPTOSSWeights *w, const GPTOSSConfig *p,
                                float *ptr, int shared_weights) {
-  int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  size_t L = (size_t)p->n_layers;
-  size_t E = (size_t)p->n_experts;
+  const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+  const size_t L = (size_t)p->n_layers;
+  const size_t E = (size_t)(p->n_experts > 0 ? p->n_experts : 1);
 
   w->tok_embeddings = ptr;
   ptr += (size_t)p->vocab_size * p->dim;
+
   w->rms_att_w = ptr;
   ptr += L * p->dim;
   w->rms_ffn_w = ptr;
@@ -270,17 +292,16 @@ static void memory_map_weights(GPTOSSWeights *w, const GPTOSSConfig *p,
   ptr += L * (size_t)p->dim * kv_dim;
   w->wo = ptr;
   ptr += L * (size_t)p->dim * p->dim;
+
   w->bq = ptr;
   ptr += L * p->dim;
   w->bk = ptr;
   ptr += L * kv_dim;
   w->bv = ptr;
   ptr += L * kv_dim;
-
   w->bo = ptr;
   ptr += L * p->dim;
 
-  // attention sink logits
   w->attn_sink = ptr;
   ptr += L * p->n_heads;
 
@@ -296,6 +317,7 @@ static void memory_map_weights(GPTOSSWeights *w, const GPTOSSConfig *p,
     ptr += L * E * (size_t)p->hidden_dim * p->dim;
     w->w_down = ptr;
     ptr += L * E * (size_t)p->dim * p->hidden_dim;
+
     w->b_up = ptr;
     ptr += L * E * p->hidden_dim;
     w->b_gate = ptr;
@@ -303,18 +325,19 @@ static void memory_map_weights(GPTOSSWeights *w, const GPTOSSConfig *p,
     w->b_down = ptr;
     ptr += L * E * p->dim;
   } else {
-    w->wr = w->br = w->w_up = w->w_gate = w->w_down = w->b_up = w->b_gate =
-        w->b_down = NULL;
+    w->wr = w->br = NULL;
+    w->w_up = w->w_gate = w->w_down = NULL;
+    w->b_up = w->b_gate = w->b_down = NULL;
   }
 
   w->rms_final_w = ptr;
   ptr += p->dim;
-  w->wcls = shared_weights ? w->tok_embeddings : ptr;
+  w->wcls =
+      shared_weights ? w->tok_embeddings : ptr; // if tied, points to embeddings
 }
 
-// Checkpoint reader (simple mmap). Header must be sizeof(GPTOSSConfig).
+// Checkpoint reader (mmap)
 static void read_checkpoint(const char *path, GPTOSSConfig *cfg,
-                            // ...existing code...
                             GPTOSSWeights *w, int *fd, float **data,
                             ssize_t *file_size) {
   FILE *f = fopen(path, "rb");
@@ -329,28 +352,40 @@ static void read_checkpoint(const char *path, GPTOSSConfig *cfg,
   fseek(f, 0, SEEK_END);
   *file_size = ftell(f);
   fclose(f);
+
   *fd = open(path, O_RDONLY);
   if (*fd == -1) {
     perror("open");
     exit(1);
   }
-  *data = (float *)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-  if (*data == MAP_FAILED) {
+
+  // Map as bytes then cast; we offset past the header when mapping pointers
+  void *bytes = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+  if (bytes == MAP_FAILED) {
     perror("mmap");
     exit(1);
   }
-  int shared = (cfg->vocab_size < 0) ? 1 : 0; // NEGATIVE => tied
+  *data = (float *)bytes;
+
+  int shared = (cfg->vocab_size < 0) ? 1 : 0;
   cfg->vocab_size = abs(cfg->vocab_size);
-  float *ptr = *data + sizeof(GPTOSSConfig) / sizeof(float);
-  memory_map_weights(w, cfg, ptr, shared);
-  // Clamp RoPE scaling to sane defaults
-  if (cfg->rope_scale <= 0.0f || !isfinite(cfg->rope_scale))
+
+  if (!(cfg->rope_scale > 0.0f && isfinite(cfg->rope_scale)))
     cfg->rope_scale = 1.0f;
-  if (cfg->rope_base <= 100.0f || !isfinite(cfg->rope_base))
+  if (!(cfg->rope_base > 0.0f && isfinite(cfg->rope_base)))
     cfg->rope_base = 10000.0f;
+  if (!(cfg->swiglu_limit > 0.0f && isfinite(cfg->swiglu_limit)))
+    cfg->swiglu_limit = 7.0f;
+
+  // Advance pointer past header
+  float *ptr = (float *)((uint8_t *)(*data) + sizeof(GPTOSSConfig));
+  memory_map_weights(w, cfg, ptr, shared);
 }
 
 static void build_model(GPTOSSModel *m, const char *checkpoint) {
+  m->fd = -1;
+  m->data = NULL;
+  m->file_size = 0;
   read_checkpoint(checkpoint, &m->config, &m->weights, &m->fd, &m->data,
                   &m->file_size);
   malloc_run_state(&m->state, &m->config);
@@ -365,145 +400,160 @@ static void free_model(GPTOSSModel *m) {
 }
 
 // -------------------------------
-// YaRN-style NTK-by-parts scaling:
+// YaRN-style NTK-by-parts scaling
+
 #define YARN_ALPHA 1.0f
 #define YARN_BETA 32.0f
+
 static inline float yarn_gamma(float r) {
-  if (r < YARN_ALPHA)
+  if (r <= YARN_ALPHA)
     return 0.0f;
-  if (r > YARN_BETA)
+  if (r >= YARN_BETA)
     return 1.0f;
   return (r - YARN_ALPHA) / (YARN_BETA - YARN_ALPHA);
 }
 
+// Apply RoPE (Q/K) with a simple YaRN-style schedule
 static inline void apply_rope_yarn(float *vec, int size, int head_size, int pos,
                                    float rope_base, float s, int L_new) {
-  if (s <= 0.0f)
+  if (!(s > 0.0f))
     s = 1.0f;
   if (s > 1024.0f)
     s = 1024.0f;
-  float concentration = (s > 1.0f) ? (1.0f + 0.1f * logf(s)) : 1.0f;
 
+  const float concentration = (s > 1.0f) ? (1.0f + 0.1f * logf(s)) : 1.0f;
+
+  // vec layout: [head0: head_size][head1: head_size]...; even/odd dims are
+  // (cos,sin) pairs
   for (int i = 0; i < size; i += 2) {
-    int j = (i % head_size) >> 1;
-    float inv_freq = powf(rope_base, -(2.0f * (float)j) / (float)head_size);
-    float L_orig = s * (float)L_new;
-    float r = L_orig * inv_freq;
-    float g = yarn_gamma(r);
-    float m = s * (1.0f - g) + 1.0f * g;
-    float angle = (float)pos * (m * inv_freq);
-    float c = cosf(angle), sd = sinf(angle);
-    float v0 = vec[i], v1 = vec[i + 1];
-    vec[i] = concentration * (v0 * c - v1 * sd);     // <- scale
-    vec[i + 1] = concentration * (v0 * sd + v1 * c); // <- scale
+    const int j = (i % head_size) >> 1;
+    const float inv_freq =
+        powf(rope_base, -(2.0f * (float)j) / (float)head_size);
+
+    const float L_orig = s * (float)L_new;
+    const float r = L_orig * inv_freq;
+    const float g = yarn_gamma(r);
+    const float m = s * (1.0f - g) + 1.0f * g; // blend
+
+    const float angle = (float)pos * (m * inv_freq);
+    const float c = cosf(angle), sd = sinf(angle);
+
+    const float v0 = vec[i], v1 = vec[i + 1];
+    vec[i] = concentration * (v0 * c - v1 * sd);
+    vec[i + 1] = concentration * (v0 * sd + v1 * c);
   }
 }
 
 // -------------------------------
-// Forward pass
-
+/* Forward pass for a single token at position `pos`.
+ * Returns pointer to logits (vocab_size).
+ */
 static float *forward(GPTOSSModel *model, int token, int pos) {
   GPTOSSConfig *p = &model->config;
   GPTOSSWeights *w = &model->weights;
   RunState *s = &model->state;
+
   const int dim = p->dim;
   const int head_size = dim / p->n_heads;
   const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  // Map each Q head to a KV head. Use modulo so it's valid even when
-  // n_heads is not divisible by n_kv_heads.
-  (void)0; // no kv_mul needed
 
-  // token embedding
+  // token embedding lookup
   memcpy(s->x, w->tok_embeddings + (size_t)token * dim, sizeof(float) * dim);
 
   for (int l = 0; l < p->n_layers; l++) {
-    // --- Attention ---
+    // ---- Attention block ----
     rmsnorm(s->xb, s->x, w->rms_att_w + (size_t)l * dim, dim);
 
-    // qkv projections (with biases)
+    // q, k, v projections (+ biases)
     matmul(s->q, s->xb, w->wq + (size_t)l * dim * dim, dim, dim);
     matmul(s->k, s->xb, w->wk + (size_t)l * dim * kv_dim, dim, kv_dim);
     matmul(s->v, s->xb, w->wv + (size_t)l * dim * kv_dim, dim, kv_dim);
+
     for (int i = 0; i < dim; i++)
       s->q[i] += w->bq[(size_t)l * dim + i];
-    for (int i = 0; i < kv_dim; i++) {
+    for (int i = 0; i < kv_dim; i++)
       s->k[i] += w->bk[(size_t)l * kv_dim + i];
+    for (int i = 0; i < kv_dim; i++)
       s->v[i] += w->bv[(size_t)l * kv_dim + i];
-    }
 
-    // RoPE with YaRN scaling
+    // RoPE (Q/K) + YaRN
     apply_rope_yarn(s->q, dim, head_size, pos, p->rope_base, p->rope_scale,
                     p->seq_len);
     apply_rope_yarn(s->k, kv_dim, head_size, pos, p->rope_base, p->rope_scale,
                     p->seq_len);
 
-    // store k/v in cache for current pos
-    size_t loff = (size_t)l * p->seq_len * kv_dim + (size_t)pos * kv_dim;
+    // write into KV cache for current position
+    const size_t loff = (size_t)l * p->seq_len * kv_dim + (size_t)pos * kv_dim;
     memcpy(s->key_cache + loff, s->k, kv_dim * sizeof(float));
     memcpy(s->val_cache + loff, s->v, kv_dim * sizeof(float));
 
-    // Attention window config
+    // Decide sliding-window vs dense for this layer
+    int apply_window = 0;
+    if (p->window > 0) {
+      if (p->alt_banded == 0)
+        apply_window = 0; // dense only
+      else if (p->alt_banded == 2)
+        apply_window = 1; // all banded
+      else if (p->alt_banded > 0)
+        apply_window = ((l % 2) == 0); // even banded
+      else
+        apply_window = ((l % 2) == 1); // odd banded
+    }
+
     int t_start = 0;
-    int apply_window = (p->window > 0) ? ((l % 2) == 0) : 0; // even layers only
     if (apply_window) {
       int wstart = pos - (p->window - 1);
       if (wstart > 0)
         t_start = wstart;
     }
 
-    // clear s->xb (attention output, packed by heads)
-    memset(s->xb, 0, sizeof(float) * dim);
+    // clear attention output buffer
+    memset(s->xb, 0, (size_t)dim * sizeof(float));
 
     for (int h = 0; h < p->n_heads; h++) {
-      float *q = s->q + h * head_size;
+      float *q = s->q + (size_t)h * head_size;
       float *att = s->att + (size_t)h * p->seq_len;
 
-      // Temporarily disable learned sink influence to validate logits
-      (void)w; // silence unused if optimized out
-
-      // clear attention scratch for active window before use
+      // compute attention logits over active window
       for (int t = t_start; t <= pos; t++) {
-        att[t] = 0.0f;
-      }
-      // compute scores against cached keys in window [t_start..pos]
-      for (int t = t_start; t <= pos; t++) {
-        const float *krow =
-            model->state.key_cache + (size_t)l * p->seq_len * kv_dim +
-            (size_t)t * kv_dim + (size_t)(h % p->n_kv_heads) * head_size;
+        const float *krow = s->key_cache + (size_t)l * p->seq_len * kv_dim +
+                            (size_t)t * kv_dim +
+                            (size_t)(h % p->n_kv_heads) * head_size;
         float score = 0.0f;
         for (int i = 0; i < head_size; i++)
           score += q[i] * krow[i];
         att[t] = score / sqrtf((float)head_size);
       }
 
-      // softmax over the active window, sink disabled
+      // numerically-stable softmax over [t_start..pos] (+ denominator-only
+      // sink)
       float mx = -1e30f;
       for (int t = t_start; t <= pos; t++)
         if (att[t] > mx)
           mx = att[t];
+
       float sum = 0.0f;
       for (int t = t_start; t <= pos; t++) {
         float e = expf(att[t] - mx);
         att[t] = e;
         sum += e;
       }
-      // add learned sink as an extra column in softmax (denominator only)
-      float sink =
-          w->attn_sink[(size_t)l * p->n_heads + h]; // BF16 in PT, fp32 here
+
+      // learned attention sink acts like an extra column in the denominator
+      const float sink = w->attn_sink[(size_t)l * p->n_heads + h];
       sum += expf(sink - mx);
 
-      float inv = 1.0f / sum;
+      const float inv = 1.0f / sum;
       for (int t = t_start; t <= pos; t++)
         att[t] *= inv;
-      // (no contribution to numerator -> nothing to add to 'out' from sink)
 
       // weighted sum of values
-      float *out = s->xb + h * head_size;
+      float *out = s->xb + (size_t)h * head_size;
       for (int t = t_start; t <= pos; t++) {
         const float a = att[t];
-        const float *vrow =
-            model->state.val_cache + (size_t)l * p->seq_len * kv_dim +
-            (size_t)t * kv_dim + (size_t)(h % p->n_kv_heads) * head_size;
+        const float *vrow = s->val_cache + (size_t)l * p->seq_len * kv_dim +
+                            (size_t)t * kv_dim +
+                            (size_t)(h % p->n_kv_heads) * head_size;
         for (int i = 0; i < head_size; i++)
           out[i] += a * vrow[i];
       }
@@ -514,76 +564,77 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
     for (int i = 0; i < dim; i++)
       s->x[i] += s->xb2[i] + w->bo[(size_t)l * dim + i];
 
-    // --- MoE FFN (top-k) ---
+    // ---- MoE FFN block ----
     rmsnorm(s->xb, s->x, w->rms_ffn_w + (size_t)l * dim, dim);
 
     if (p->n_experts > 0 && p->top_k > 0) {
-      // router logits: (n_experts)
+      // router logits -> softmax over top-k experts
       matmul(s->router, s->xb, w->wr + (size_t)l * p->n_experts * dim, dim,
              p->n_experts);
       for (int e = 0; e < p->n_experts; e++)
         s->router[e] += w->br[(size_t)l * p->n_experts + e];
 
-      // pick top-k experts and softmax their logits
-      float topv[32]; // supports up to k<=32
+      float topv[64]; // supports up to k<=64
       topk_indices(s->router, p->n_experts, p->top_k, s->topk_idx, topv);
       for (int i = 0; i < p->top_k; i++)
         s->topk_weight[i] = topv[i];
       softmax_inplace(s->topk_weight, p->top_k);
 
-      // compute weighted sum of expert outputs
-      memset(s->xb2, 0, sizeof(float) * dim);
+      // accumulate expert outputs: sum_r softmax_r * Down( SwiGLU(Up, Gate) )
+      memset(s->xb2, 0, (size_t)dim * sizeof(float));
+
+      const float alpha = 1.702f;          // SiLU multiplier (SwiGLU)
+      const float limit = p->swiglu_limit; // clamp
+
       for (int r = 0; r < p->top_k; r++) {
         const int e = s->topk_idx[r];
         if (e < 0)
           continue;
         const float w_r = s->topk_weight[r];
+
         const size_t up_off =
             ((size_t)l * p->n_experts + e) * (size_t)p->hidden_dim * p->dim;
-        const size_t gate_off = up_off; // same shape as up
+        const size_t gate_off = up_off;
         const size_t down_off =
             ((size_t)l * p->n_experts + e) * (size_t)p->dim * p->hidden_dim;
+
         const size_t bu_off =
             ((size_t)l * p->n_experts + e) * (size_t)p->hidden_dim;
         const size_t bg_off = bu_off;
         const size_t bd_off = ((size_t)l * p->n_experts + e) * (size_t)p->dim;
 
-        // hb = W_up * x + b_up
+        // Up and Gate projections (+ biases)
         matmul(s->hb, s->xb, w->w_up + up_off, p->dim, p->hidden_dim);
         for (int i = 0; i < p->hidden_dim; i++)
           s->hb[i] += w->b_up[bu_off + i];
-        // hb2 = W_gate * x + b_gate
+
         matmul(s->hb2, s->xb, w->w_gate + gate_off, p->dim, p->hidden_dim);
         for (int i = 0; i < p->hidden_dim; i++)
           s->hb2[i] += w->b_gate[bg_off + i];
 
-        // SwiGLU (standard)
-        const float alpha = 1.702f;
-        const float limit = 7.0f; // matches ModelConfig.swiglu_limit
-
+        // Clamp pre-activations
         for (int i = 0; i < p->hidden_dim; i++) {
-          float xg = s->hb[i];  // GLU branch
-          float xl = s->hb2[i]; // linear branch
+          float u = s->hb[i];
+          float g = s->hb2[i];
 
-          // clamp like the PT code
-          if (xg > limit)
-            xg = limit; // max only
-          if (xl > limit)
-            xl = limit; // both sides
-          if (xl < -limit)
-            xl = -limit;
+          if (u > limit)
+            u = limit; // up branch: clamp high only (matches ref)
+          if (g > limit)
+            g = limit; // gate branch: clamp both sides
+          if (g < -limit)
+            g = -limit;
 
-          // swiglu with alpha and extra +1 bias on linear branch
-          float sw = xg * (1.0f / (1.0f + expf(-alpha * xg)));
-          s->hb[i] = sw * (xl + 1.0f);
+          // SiLU(up) * (gate + 1)
+          float silu = u * (1.0f / (1.0f + expf(-alpha * u)));
+          s->hb[i] = silu * (g + 1.0f);
         }
 
-        // down-projection + bias -> tmp into xb
+        // Down projection (+ bias) into xb (temp)
         matmul(s->xb, s->hb, w->w_down + down_off, p->hidden_dim, p->dim);
         for (int i = 0; i < p->dim; i++)
           s->xb[i] += w->b_down[bd_off + i];
 
-        // accumulate routed output
+        // Weighted accumulation
         for (int i = 0; i < dim; i++)
           s->xb2[i] += w_r * s->xb[i];
       }
@@ -592,7 +643,8 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
       for (int i = 0; i < dim; i++)
         s->x[i] += s->xb2[i];
     } else {
-      // (Optional) dense FFN fallback could be implemented here if needed.
+      // (Optional) dense FFN fallback could be added here if a dense checkpoint
+      // is used.
     }
   }
 
@@ -603,13 +655,13 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
 }
 
 // -------------------------------
-// Sampler
+// Sampler (greedy)
 
 typedef struct {
   int vocab_size;
 } Sampler;
 
-static int sample_argmax(const float *p, int n) {
+static inline int sample_argmax(const float *p, int n) {
   int mi = 0;
   float mv = p[0];
   for (int i = 1; i < n; i++)
@@ -620,17 +672,16 @@ static int sample_argmax(const float *p, int n) {
   return mi;
 }
 
-static int sample_next(Sampler *s, float *logits) {
-  // Only greedy decoding: always pick argmax
+static inline int sample_next(Sampler *s, float *logits) {
+  (void)s;
   return sample_argmax(logits, s->vocab_size);
 }
 
 // -------------------------------
-// Minimal CLI
+// CLI
 
 #ifndef TESTING
-
-static void usage() {
+static void usage(void) {
   fprintf(stderr, "Usage: gpt-oss <checkpoint.bin> -i \"prompt\" -n <steps> "
                   "[-t tokenizer.bin]\n");
   exit(1);
@@ -643,7 +694,6 @@ int main(int argc, char **argv) {
   const char *prompt = "Hello";
   const char *tokpath = "tokenizer.bin";
   int steps = 64;
-  // Only greedy decoding supported
 
   for (int i = 2; i < argc; i++) {
     if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
@@ -668,21 +718,30 @@ int main(int argc, char **argv) {
   if (steps <= 0 || steps > model.config.seq_len)
     steps = model.config.seq_len;
 
-  // Load tokenizer
+  // Tokenizer
   Tokenizer tokenizer;
   read_tokenizer(&tokenizer, tokpath, model.config.vocab_size);
 
-  // Discover special tokens in the vocab (o200k)
-  int BOS = find_token_id(&tokenizer, "<|start|>", (int)strlen("<|start|>"));
-  int EOS = find_token_id(&tokenizer, "<|return|>", (int)strlen("<|return|>"));
-  // BOS = <|start|> (200006)
-  // EOS = <|end|> (200007) for per-message, or <|return|> (200002) for
-  // end-of-completion.
-  printf("BOS token id: %d\n", BOS);
-  printf("EOS token id: %d\n", EOS);
+  // Find special tokens (prefer end-of-message; fall back to end-of-text or
+  // return)
+  const char *TOK_START = "<|start|>";
+  const char *TOK_END = "<|end|>";
+  const char *TOK_EOT = "<|endoftext|>";
+  const char *TOK_RETURN = "<|return|>";
 
-  // Encode prompt (only add BOS if we actually found it; don't auto-append
-  // EOS)
+  int BOS = find_token_id(&tokenizer, TOK_START, (int)strlen(TOK_START));
+  int EOS = -1;
+  int tmp = find_token_id(&tokenizer, TOK_END, (int)strlen(TOK_END));
+  if (tmp >= 0)
+    EOS = tmp;
+  tmp = find_token_id(&tokenizer, TOK_EOT, (int)strlen(TOK_EOT));
+  if (EOS < 0 && tmp >= 0)
+    EOS = tmp;
+  tmp = find_token_id(&tokenizer, TOK_RETURN, (int)strlen(TOK_RETURN));
+  if (EOS < 0 && tmp >= 0)
+    EOS = tmp;
+
+  // Encode prompt (BOS if available; no EOS)
   int *tokens = (int *)malloc(sizeof(int) * (model.config.seq_len));
   int ntok = 0;
   encode(&tokenizer, prompt, BOS, -1, tokens, &ntok, model.config.seq_len);
@@ -691,10 +750,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // Sampler
   Sampler sampler = {.vocab_size = model.config.vocab_size};
 
-  // ---- KV warmup: run the ENTIRE prompt through the model
+  // Run prompt to fill KV cache (print recovered text pieces)
   int pos = 0;
   int token = tokens[0];
   for (; pos < ntok - 1; pos++) {
@@ -704,19 +762,15 @@ int main(int argc, char **argv) {
     fflush(stdout);
     token = tokens[pos + 1];
   }
-  // Now 'token' is the last prompt token and 'pos == ntok-1'.
-  // We will start sampling from here and print ONLY new tokens.
 
-  // Number of tokens to *generate* (not counting prompt)
+  // Generate continuation (new tokens only)
   int to_generate = steps;
   if (to_generate > model.config.seq_len - ntok)
     to_generate = model.config.seq_len - ntok;
 
-  // Generate continuation
   int generated = 0;
   while (generated < to_generate) {
     float *logits = forward(&model, token, pos);
-
     int next = sample_next(&sampler, logits);
     if (EOS >= 0 && next == EOS)
       break;
