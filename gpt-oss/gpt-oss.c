@@ -234,11 +234,11 @@ static void read_tokenizer(Tokenizer *t, const char *path, int vocab_size) {
   for (int b = 0; b < 256; b++)
     t->byte_tokens[b] = -1;
 
-  // find byte tokens "<0xHH>" and precompute decode table
-  char tmp[8];
+  // Find all single-byte tokens in vocab and map them
   for (int b = 0; b < 256; b++) {
-    snprintf(tmp, sizeof(tmp), "<0x%02X>", b);
-    int id = find_token_id(t, tmp, (int)strlen(tmp));
+    unsigned char byte_val = (unsigned char)b;
+    char s[2] = {(char)byte_val, 0};
+    int id = find_token_id(t, s, 1);
     t->byte_tokens[b] = id;
     t->byte_pieces[b * 2] = (unsigned char)b;
     t->byte_pieces[b * 2 + 1] = '\0';

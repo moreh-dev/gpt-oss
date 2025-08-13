@@ -92,15 +92,7 @@ def main():
             scores[tid] = -1e30
         else:
             b = id_to_bytes[tid]
-            if b is None:
-                # Shouldn't happen, but keep file consistent
-                b = b""  # empty
-            # For single non-printable byte, substitute <0xHH> text that C expects
-            if len(b) == 1 and not is_printable_ascii_byte(b[0]):
-                s_bytes = f"<0x{b[0]:02X}>".encode("ascii")
-            else:
-                s_bytes = b
-            # Score: invert rank so larger is better (C picks max score)
+            s_bytes = b
             scores[tid] = float(-tid)
 
         token_bytes_out.append(s_bytes)

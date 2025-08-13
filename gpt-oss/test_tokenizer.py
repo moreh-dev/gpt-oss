@@ -58,19 +58,8 @@ def main():
         )
         sys.exit(2)
 
-    prompts = [
-        "Hello",
-        "Hello world",
-        "Write a short haiku about the ocean.",
-        "ฉันรักทะเล",  # Thai
-        "naïve façade — déjà vu",
-        "🍣 sushi and 🍜 ramen",
-        "email: test@example.com",
-        "newlines:\nline2\nline3",
-        "tabs\tand\tspaces",
-        'JSON: {"a": 1, "b": [2,3,4]}',
-        "混ぜるな危険",
-    ]
+    with open("prompts.txt", encoding="utf-8") as f:
+        prompts = [line.rstrip("\n") for line in f]
 
     ok = 0
     bad = 0
