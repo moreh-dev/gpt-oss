@@ -576,9 +576,7 @@ static void read_checkpoint(const char *path, GPTOSSConfig *cfg,
     perror("mmap");
     exit(1);
   }
-  int shared = (cfg->vocab_size > 0)
-                   ? 1
-                   : 0; // POSITIVE => tied weights (match llama2.c)
+  int shared = (cfg->vocab_size < 0) ? 1 : 0; // NEGATIVE => tied
   cfg->vocab_size = abs(cfg->vocab_size);
   float *ptr = *data + sizeof(GPTOSSConfig) / sizeof(float);
   memory_map_weights(w, cfg, ptr, shared);
