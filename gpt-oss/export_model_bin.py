@@ -1,6 +1,7 @@
 # python export_model_bin.py ./gpt-oss-20b ./gpt-oss-20b.bin
 
 import json
+from math import gcd
 import pathlib
 import struct
 import sys
@@ -180,22 +181,30 @@ def decode_mxfp4(
 # =============== Attention helpers ===============
 
 
-def infer_kv_from_fused_qkv_strict(T, i, dim, nH):
+def infer_heads_from_fused_qkv(T, i, dim):
+    """
+    For original/ checkpoints with fused QKV:
+      rows = dim (Q) + kv_dim_fused (K) + kv_dim_fused (V)
+    Derive head_dim = gcd(dim, kv_dim_fused),
+           n_heads  = dim / head_dim,
+           n_kv     = kv_dim_fused / head_dim.
+    """
     key = f"block.{i}.attn.qkv.weight"
-    if key not in T:  # sharded HF path may not have fused qkv
+    if key not in T:
         return None
-    out_rows = int(T[key].shape[0])
-    if out_rows <= dim or (out_rows - dim) % 2 != 0:
+    rows = int(T[key].shape[0])
+    if rows <= dim or (rows - dim) % 2 != 0:
         raise ValueError(
-            f"layer {i}: unexpected fused qkv rows={out_rows}, dim={dim}")
-    kv_dim_fused = (out_rows - dim) // 2
-    head_dim = dim // nH
-    if kv_dim_fused % head_dim != 0:
+            f"layer {i}: unexpected fused qkv rows={rows}, dim={dim}")
+    kv_dim_fused = (rows - dim) // 2
+    hd = gcd(dim, kv_dim_fused)
+    if hd <= 0 or (dim % hd) or (kv_dim_fused % hd):
         raise ValueError(
-            f"fused kv_dim={kv_dim_fused} not multiple of head_dim={head_dim} "
-            f"(rows={out_rows}, dim={dim}, n_heads={nH})")
-    nKV_infer = kv_dim_fused // head_dim
-    return kv_dim_fused, nKV_infer
+            f"cannot derive head_dim from dim={dim}, kv_dim_fused={kv_dim_fused}"
+        )
+    nH = dim // hd
+    nKV = kv_dim_fused // hd
+    return hd, nH, nKV, kv_dim_fused
 
 
 def split_fused_qkv(fused: np.ndarray, dim: int, kv_dim: int, i: int):
@@ -518,7 +527,7 @@ def main():
                 cfg.get("rope_scaling",
                         {}).get("original_max_position_embeddings", 0))))
     win = int(cfg.get("sliding_window", 0))
-    alt = 1
+    alt = 1 if win > 0 else 0  # only alternate banded if sliding_window is set
     ropeB = float(
         cfg.get("rope_theta",
                 cfg.get("rope_scaling", {}).get("base", 10000.0)))
@@ -531,18 +540,16 @@ def main():
     topk = int(cfg.get("num_experts_per_tok", cfg.get("experts_per_token", 0)))
 
     # --- infer/override n_heads, n_kv_heads, head_dim, kv_dim ---
-    # Try fused qkv (original/)
-    res = infer_kv_from_fused_qkv_strict(T, 0, dim, nH)
-    if res is not None:
-        kv_dim_fused, nKV_infer = res
-        head_dim = kv_dim_fused // nKV_infer
-        nH_new = dim // head_dim
-        if nH_new != nH or nKV_infer != nKV:
+    # Prefer fused QKV (original/) and override config if inconsistent.
+    fused = infer_heads_from_fused_qkv(T, 0, dim)
+    if fused is not None:
+        head_dim, nH_new, nKV_new, kv_dim_fused = fused
+        if (nH_new != nH) or (nKV_new != nKV):
             print(
-                f"[INFO] overriding heads to match fused QKV: n_heads {nH}->{nH_new}, n_kv_heads {nKV}->{nKV_infer}, head_dim={head_dim}"
+                f"[INFO] overriding heads from fused QKV: "
+                f"n_heads {nH}->{nH_new}, n_kv_heads {nKV}->{nKV_new}, head_dim={head_dim}"
             )
-            nH = nH_new
-            nKV = nKV_infer
+            nH, nKV = nH_new, nKV_new
         kv_dim = kv_dim_fused
     else:
         # HF separate K path: infer from K rows

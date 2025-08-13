@@ -668,7 +668,7 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
 
     // Attention window config
     int t_start = 0;
-    if (p->alt_banded && (l % 2 == 0)) {
+    if (p->alt_banded && p->window > 0 && (l % 2 == 0)) {
       int wstart = pos - (p->window - 1);
       if (wstart > 0)
         t_start = wstart;
