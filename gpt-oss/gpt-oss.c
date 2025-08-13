@@ -380,8 +380,6 @@ static inline void apply_rope_yarn(float *vec, int size, int head_size, int pos,
     s = 1.0f;
   if (s > 1024.0f)
     s = 1024.0f; // sanity clamp for extreme configs
-  if (s > 1024.0f)
-    s = 1024.0f; // sanity clamp for extreme configs
   for (int i = 0; i < size; i += 2) {
     int j = (i % head_size) >> 1;
     float inv_freq = powf(rope_base, -(2.0f * (float)j) / (float)head_size);
@@ -407,7 +405,9 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
   const int dim = p->dim;
   const int head_size = dim / p->n_heads;
   const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  const int kv_mul = p->n_heads / p->n_kv_heads;
+  // Map each Q head to a KV head. Use modulo so it's valid even when
+  // n_heads is not divisible by n_kv_heads.
+  (void)0; // no kv_mul needed
 
   // token embedding
   memcpy(s->x, w->tok_embeddings + (size_t)token * dim, sizeof(float) * dim);
@@ -466,7 +466,7 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
       for (int t = t_start; t <= pos; t++) {
         const float *krow =
             model->state.key_cache + (size_t)l * p->seq_len * kv_dim +
-            (size_t)t * kv_dim + (size_t)(h / kv_mul) * head_size;
+            (size_t)t * kv_dim + (size_t)(h % p->n_kv_heads) * head_size;
         float score = 0.0f;
         for (int i = 0; i < head_size; i++)
           score += q[i] * krow[i];
@@ -479,9 +479,6 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
         if (att[t] > mx)
           mx = att[t];
       float sum = expf(sink - mx); // sink contribution only in denom
-      for (int t = t_start; t <= pos; t++) {
-        att[t] = 0.0f; // zero scratch before use
-      }
       for (int t = t_start; t <= pos; t++) {
         float e = expf(att[t] - mx);
         att[t] = e;
@@ -497,7 +494,7 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
         const float a = att[t];
         const float *vrow =
             model->state.val_cache + (size_t)l * p->seq_len * kv_dim +
-            (size_t)t * kv_dim + (size_t)(h / kv_mul) * head_size;
+            (size_t)t * kv_dim + (size_t)(h % p->n_kv_heads) * head_size;
         for (int i = 0; i < head_size; i++)
           out[i] += a * vrow[i];
       }
