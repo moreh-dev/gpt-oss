@@ -28,12 +28,21 @@ def run_c_encoder(binary, tokbin, text):
 
 
 def main():
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True, help="path to token_test binary")
     ap.add_argument("--tok", required=True, help="path to tokenizer.bin")
+    ap.add_argument("--verbose",
+                    action="store_true",
+                    help="print all mismatches in detail")
     args = ap.parse_args()
 
     enc = tiktoken.get_encoding("o200k_harmony")
+    if enc.name != "o200k_harmony":
+        print(
+            f"[ERROR] tiktoken encoding is {enc.name}, expected 'o200k_harmony'"
+        )
+        sys.exit(2)
 
     prompts = [
         "Hello",
@@ -54,16 +63,22 @@ def main():
 
     for p in prompts:
         c_ids = run_c_encoder(args.bin, args.tok, p)
-        py_ids = enc.encode(" " +
-                            p)  # match C encoder's injected leading space
+        tiktoken_prompt = " " + p
+        py_ids = enc.encode(tiktoken_prompt)
 
         match = (c_ids == py_ids)
         status = "OK" if match else "MISMATCH"
-        print(f"[{status}] {p!r}")
+        print(f"prompt = {p!r}")
+        print(f"  tiktoken prompt: {tiktoken_prompt!r}")
+        print(f"  [{status}] tokens: C={len(c_ids)} PY={len(py_ids)}")
         if not match:
-            print("  C  :", c_ids[:80])
-            print("  PY :", py_ids[:80])
             bad += 1
+            if args.verbose:
+                print("    C  :", c_ids)
+                print("    PY :", py_ids)
+            else:
+                print("    C  :", c_ids[:80])
+                print("    PY :", py_ids[:80])
         else:
             ok += 1
 

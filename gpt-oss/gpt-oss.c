@@ -2,6 +2,7 @@
 #define TOKENINDEX_DEFINED
 typedef struct {
   const char *str;
+  int len;
   int id;
 } TokenIndex;
 #endif // TOKENINDEX_DEFINED
@@ -148,6 +149,7 @@ typedef struct {
 
 typedef struct {
   char **vocab;  // [vocab_size] UTF-8 strings; "<0xHH>" for byte tokens
+  int *lengths;  // [vocab_size] length of each token
   float *scores; // [vocab_size] BPE ranks (higher preferred)
   int vocab_size;
   int max_token_length;
@@ -163,17 +165,26 @@ typedef struct {
 static int compare_tokens(const void *a, const void *b) {
   const TokenIndex *pa = (const TokenIndex *)a;
   const TokenIndex *pb = (const TokenIndex *)b;
-  return strcmp(pa->str, pb->str);
+  int minlen = pa->len < pb->len ? pa->len : pb->len;
+  int cmp = memcmp(pa->str, pb->str, minlen);
+  if (cmp != 0)
+    return cmp;
+  return pa->len - pb->len;
 }
 
-static int find_token_id(Tokenizer *t, const char *s) {
+static int find_token_id(Tokenizer *t, const char *s, int len) {
   // binary search in sorted_vocab
   int lo = 0, hi = t->vocab_size - 1;
   while (lo <= hi) {
     int mid = (lo + hi) >> 1;
-    int cmp = strcmp(t->sorted_vocab[mid].str, s);
-    if (cmp == 0)
-      return t->sorted_vocab[mid].id;
+    int cmp =
+        memcmp(t->sorted_vocab[mid].str, s,
+               len < t->sorted_vocab[mid].len ? len : t->sorted_vocab[mid].len);
+    if (cmp == 0) {
+      if (len == t->sorted_vocab[mid].len)
+        return t->sorted_vocab[mid].id;
+      cmp = len - t->sorted_vocab[mid].len;
+    }
     if (cmp < 0)
       lo = mid + 1;
     else
@@ -196,9 +207,10 @@ static void read_tokenizer(Tokenizer *t, const char *path, int vocab_size) {
   }
 
   t->vocab = (char **)calloc(vocab_size, sizeof(char *));
+  t->lengths = (int *)calloc(vocab_size, sizeof(int));
   t->scores = (float *)calloc(vocab_size, sizeof(float));
   t->sorted_vocab = (TokenIndex *)calloc(vocab_size, sizeof(TokenIndex));
-  if (!t->vocab || !t->scores || !t->sorted_vocab) {
+  if (!t->vocab || !t->scores || !t->sorted_vocab || !t->lengths) {
     fprintf(stderr, "OOM tokenizer\n");
     exit(1);
   }
@@ -225,8 +237,10 @@ static void read_tokenizer(Tokenizer *t, const char *path, int vocab_size) {
     }
     buf[len] = '\0';
     t->vocab[i] = buf;
+    t->lengths[i] = len;
     t->scores[i] = score;
     t->sorted_vocab[i].str = t->vocab[i];
+    t->sorted_vocab[i].len = len;
     t->sorted_vocab[i].id = i;
   }
   fclose(f);
@@ -238,7 +252,7 @@ static void read_tokenizer(Tokenizer *t, const char *path, int vocab_size) {
   char tmp[8];
   for (int b = 0; b < 256; b++) {
     snprintf(tmp, sizeof(tmp), "<0x%02X>", b);
-    int id = find_token_id(t, tmp);
+    int id = find_token_id(t, tmp, (int)strlen(tmp));
     t->byte_tokens[b] = id;
     t->byte_pieces[b * 2] = (unsigned char)b;
     t->byte_pieces[b * 2 + 1] = '\0';
@@ -260,17 +274,25 @@ static void free_tokenizer(Tokenizer *t) {
 static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
                    int *out, int *n_out, int max_tokens) {
   // Start from raw bytes -> initial token list (each byte -> byte token id)
-  int len = (int)strlen(text);
+  // Inject leading space if not present, to match tiktoken behavior
+  const char *input = text;
+  char *tmp = NULL;
+  if (text[0] != ' ') {
+    size_t n = strlen(text);
+    tmp = (char *)malloc(n + 2);
+    tmp[0] = ' ';
+    memcpy(tmp + 1, text, n + 1);
+    input = tmp;
+  }
+  int len = (int)strlen(input);
   int *tokens = (int *)malloc(sizeof(int) * (len + 3));
   int ntok = 0;
   if (bos_id >= 0)
     tokens[ntok++] = bos_id;
-  // removed dummy prefix space injection (tiktoken-style vocab already has
-  // leading-space tokens) UTF-8 aware accumulation (compatible with llama2.c
-  // behavior)
+  // UTF-8 aware accumulation (compatible with llama2.c behavior)
   size_t str_len = 0;
   char buf[8] = {0};
-  for (const char *c = text; *c != '\0'; c++) {
+  for (const char *c = input; *c != '\0'; c++) {
     if (((*c & 0xC0) != 0x80))
       str_len = 0; // reset at new codepoint
     buf[str_len++] = *c;
@@ -278,7 +300,7 @@ static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
     if (((*(c + 1) & 0xC0) == 0x80) && str_len < 4)
       continue;
 
-    int id = find_token_id(t, buf);
+    int id = find_token_id(t, buf, (int)str_len);
     if (id >= 0) {
       tokens[ntok++] = id;
     } else {
@@ -292,6 +314,8 @@ static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
     }
     str_len = 0;
   }
+  if (tmp)
+    free(tmp);
 
   // greedy BPE merges by best score
   char **pieces = (char **)malloc(sizeof(char *) * ntok);
@@ -312,7 +336,7 @@ static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
       memcpy(cat, a, la);
       memcpy(cat + la, b, lb);
       cat[lsum] = '\0';
-      int id = find_token_id(t, cat);
+      int id = find_token_id(t, cat, (int)lsum);
       free(cat);
       if (id >= 0 && t->scores[id] > best_score) {
         best_score = t->scores[id];
@@ -980,12 +1004,16 @@ int main(int argc, char **argv) {
   read_tokenizer(&tokenizer, tokpath, model.config.vocab_size);
 
   // Try to discover special tokens in the vocab (o200k)
-  int BOS = find_token_id(&tokenizer, "<|begin_of_text|>");
+  int BOS = find_token_id(&tokenizer, "<|begin_of_text|>",
+                          (int)strlen("<|begin_of_text|>"));
   if (BOS < 0)
-    BOS = find_token_id(&tokenizer, "<|beginoftext|>");
-  int EOS = find_token_id(&tokenizer, "<|end_of_text|>");
+    BOS = find_token_id(&tokenizer, "<|beginoftext|>",
+                        (int)strlen("<|beginoftext|>"));
+  int EOS = find_token_id(&tokenizer, "<|end_of_text|>",
+                          (int)strlen("<|end_of_text|>"));
   if (EOS < 0)
-    EOS = find_token_id(&tokenizer, "<|endoftext|>");
+    EOS = find_token_id(&tokenizer, "<|endoftext|>",
+                        (int)strlen("<|endoftext|>"));
 
   // Encode prompt (only add BOS if we actually found it; don't auto-append EOS)
   int *tokens = (int *)malloc(sizeof(int) * (model.config.seq_len));
