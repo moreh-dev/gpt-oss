@@ -145,22 +145,39 @@ typedef struct {
 } GPTOSSModel;
 
 // -------------------------------
-// Tokenizer (Karpathy llama2.c binary format)
+// ==============================
+// Tokenizer: robust encode/decode
+// ==============================
+
+#ifndef TOKENINDEX_DEFINED
+#define TOKENINDEX_DEFINED
+typedef struct {
+  const char *str;
+  int len;
+  int id;
+} TokenIndex;
+#endif // TOKENINDEX_DEFINED
 
 typedef struct {
-  char **vocab;  // [vocab_size] UTF-8 strings; "<0xHH>" for byte tokens
-  int *lengths;  // [vocab_size] length of each token
-  float *scores; // [vocab_size] BPE ranks (higher preferred)
+  char *
+      *vocab; // [vocab_size] UTF-8 strings; may contain raw 1-byte or "<0xHH>"
+  int *lengths;  // [vocab_size] cached lengths
+  float *scores; // [vocab_size] rank-like; lower (more negative) = earlier
+                 // merge; specials very negative (~-1e30)
   int vocab_size;
   int max_token_length;
 
-  // binary search accel
-  TokenIndex *sorted_vocab;
+  TokenIndex *sorted_vocab; // for bsearch by (bytes,len)
 
-  // byte lookup
-  int byte_tokens[256];           // map byte -> token id for "<0xHH>"
-  unsigned char byte_pieces[512]; // interleaved bytes + NULs for decode
+  // Byte token maps (supports either style)
+  // For each 0..255, gives token id or -1 if not present.
+  int byte_tokens[256];
+
+  // small decode scratch for "<0xHH>" path
+  unsigned char byte_pieces[512]; // interleaved byte + NUL
 } Tokenizer;
+
+// --------- helpers
 
 static int compare_tokens(const void *a, const void *b) {
   const TokenIndex *pa = (const TokenIndex *)a;
@@ -179,14 +196,43 @@ static int find_token_id(Tokenizer *t, const char *s, int len) {
   return res ? res->id : -1;
 }
 
+// C-safe helper to parse a single hex nibble
+static inline int hex_nibble(int c) {
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return -1;
+}
+
+// Detect "<0xHH>" format and parse to byte (returns 1 on success)
+static int parse_hex_byte_token(const char *s, int len, unsigned char *out) {
+  if (len != 6)
+    return 0; // expects exactly "<0xHH>"
+  if (s[0] != '<' || s[1] != '0' || s[2] != 'x' || s[5] != '>')
+    return 0;
+
+  int h = hex_nibble((unsigned char)s[3]);
+  int l = hex_nibble((unsigned char)s[4]);
+  if (h < 0 || l < 0)
+    return 0;
+
+  *out = (unsigned char)((h << 4) | l);
+  return 1;
+}
+
 static void read_tokenizer(Tokenizer *t, const char *path, int vocab_size) {
   memset(t, 0, sizeof(*t));
   t->vocab_size = vocab_size;
+
   FILE *f = fopen(path, "rb");
   if (!f) {
     fprintf(stderr, "tokenizer open %s failed: %s\n", path, strerror(errno));
     exit(1);
   }
+
   if (fread(&t->max_token_length, sizeof(int), 1, f) != 1) {
     fprintf(stderr, "bad tokenizer header\n");
     exit(1);
@@ -212,7 +258,7 @@ static void read_tokenizer(Tokenizer *t, const char *path, int vocab_size) {
       fprintf(stderr, "bad tokenizer file (len)\n");
       exit(1);
     }
-    char *buf = (char *)malloc(len + 1);
+    char *buf = (char *)malloc((size_t)len + 1);
     if (!buf) {
       fprintf(stderr, "OOM\n");
       exit(1);
@@ -222,24 +268,38 @@ static void read_tokenizer(Tokenizer *t, const char *path, int vocab_size) {
       exit(1);
     }
     buf[len] = '\0';
+
     t->vocab[i] = buf;
     t->lengths[i] = len;
     t->scores[i] = score;
-    t->sorted_vocab[i].str = t->vocab[i];
+    t->sorted_vocab[i].str = buf;
     t->sorted_vocab[i].len = len;
     t->sorted_vocab[i].id = i;
   }
   fclose(f);
+
   qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
+
+  // Build byte token map for both representations
   for (int b = 0; b < 256; b++)
     t->byte_tokens[b] = -1;
 
-  // Find all single-byte tokens in vocab and map them
+  for (int i = 0; i < vocab_size; i++) {
+    const char *s = t->vocab[i];
+    int len = t->lengths[i];
+    unsigned char byte_val;
+
+    if (len == 1) {
+      // raw single-byte token
+      byte_val = (unsigned char)s[0];
+      t->byte_tokens[byte_val] = i;
+    } else if (parse_hex_byte_token(s, len, &byte_val)) {
+      t->byte_tokens[byte_val] = i;
+    }
+  }
+
+  // tiny helpers for decode path (optional)
   for (int b = 0; b < 256; b++) {
-    unsigned char byte_val = (unsigned char)b;
-    char s[2] = {(char)byte_val, 0};
-    int id = find_token_id(t, s, 1);
-    t->byte_tokens[b] = id;
     t->byte_pieces[b * 2] = (unsigned char)b;
     t->byte_pieces[b * 2 + 1] = '\0';
   }
@@ -253,130 +313,161 @@ static void free_tokenizer(Tokenizer *t) {
       free(t->vocab[i]);
   }
   free(t->vocab);
+  free(t->lengths);
   free(t->scores);
   free(t->sorted_vocab);
 }
 
+// Greedy BPE with minimal allocations.
+// - Start from raw bytes -> byte tokens
+// - Repeatedly merge adjacent pairs if the concatenation exists
+//   and is not "special" (score <= -1e29 treated as special marker).
 static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
                    int *out, int *n_out, int max_tokens) {
   const unsigned char *p = (const unsigned char *)text;
+  int text_len = (int)strlen((const char *)p);
 
-  // 1) Seed from BYTES ONLY: map every input byte -> its byte token.
-  //    (No codepoint probing; matches tiktoken/o200k behavior.)
-  int cap = (int)strlen((const char *)p) + 2; // +BOS/+EOS slack
-  int *tokens = (int *)malloc(sizeof(int) * cap);
+  // Worst-case capacity (bytes + BOS + EOS)
+  int cap = text_len + 2;
+  int *tokens = (int *)malloc(sizeof(int) * (size_t)cap);
+  if (!tokens) {
+    fprintf(stderr, "encode OOM\n");
+    exit(1);
+  }
+
   int ntok = 0;
-
-  if (bos_id >= 0) {
+  if (bos_id >= 0)
     tokens[ntok++] = bos_id;
+
+  // 1) Bytes -> initial tokens
+  for (int i = 0; i < text_len; i++) {
+    int id = t->byte_tokens[p[i]];
+    if (id < 0) {
+      // Should not happen for a sane tokenizer; fallback to first vocab id
+      // (usually <unk>)
+      id = 0;
+    }
+    tokens[ntok++] = id;
   }
 
-  for (; *p; ++p) {
-    int bid = t->byte_tokens[*p];
-    if (bid < 0)
-      bid = 0; // fallback <unk> if somehow missing
-    tokens[ntok++] = bid;
+  // Scratch for candidate concatenations, allocated once up to max_token_length
+  char *cat = (char *)malloc((size_t)t->max_token_length + 1);
+  if (!cat) {
+    fprintf(stderr, "encode OOM (cat)\n");
+    exit(1);
   }
 
-  // 2) Greedy BPE merges: always pick the highest-score mergeable pair.
-  //    (exporter sets scores = -token_id for normals; specials = -1e30.)
-  char **pieces = (char **)malloc(sizeof(char *) * ntok);
-  for (int i = 0; i < ntok; i++)
+  // 2) Greedy merges: lowest score (rank) wins, skip specials
+  // We'll maintain a parallel array of (piece ptr, len) to avoid strlen.
+  const char **pieces = (const char **)malloc(sizeof(char *) * (size_t)ntok);
+  int *plens = (int *)malloc(sizeof(int) * (size_t)ntok);
+  if (!pieces || !plens) {
+    fprintf(stderr, "encode OOM (pieces)\n");
+    exit(1);
+  }
+  for (int i = 0; i < ntok; i++) {
     pieces[i] = t->vocab[tokens[i]];
+    plens[i] = t->lengths[tokens[i]];
+  }
 
-  int merge_step = 0;
   while (1) {
-    float best_score = 1e30f; // Use lowest score (rank) for BPE merges
-    int best_idx = -1;
-    int best_id = -1;
-    int best_la = 0, best_lb = 0;
+    float best_score = 1e29f;
+    int best_idx = -1, best_id = -1;
 
-    // scan adjacent pairs
     for (int i = 0; i < ntok - 1; i++) {
-      const char *a = pieces[i];
-      const char *b = pieces[i + 1];
-      int la = (int)strlen(a), lb = (int)strlen(b);
+      int la = plens[i], lb = plens[i + 1];
       int lsum = la + lb;
       if (lsum > t->max_token_length)
         continue;
 
-      char *cat = (char *)malloc(lsum + 1);
-      memcpy(cat, a, la);
-      memcpy(cat + la, b, lb);
+      // Build concatenation in scratch
+      memcpy(cat, pieces[i], (size_t)la);
+      memcpy(cat + la, pieces[i + 1], (size_t)lb);
       cat[lsum] = '\0';
 
       int id = find_token_id(t, cat, lsum);
-      float score = (id >= 0) ? t->scores[id] : 0.0f;
-      free(cat);
-
-      // Skip if not found or is a special token (very negative score)
-      if (id < 0 || t->scores[id] <= -1e29f)
+      if (id < 0)
         continue;
 
-      // Use lowest score (rank) for BPE merges
-      if (t->scores[id] < best_score) {
-        best_score = t->scores[id];
+      float score = t->scores[id];
+      // Treat very negative scores as "special" => non-mergeable
+      if (score <= -1e29f)
+        continue;
+
+      // Lower score = earlier merge (rank). Choose the minimum.
+      if (score < best_score) {
+        best_score = score;
         best_idx = i;
         best_id = id;
-        best_la = la;
-        best_lb = lb;
       }
-      // Tie-break: leftmost (already handled by <)
     }
 
-    if (best_idx == -1)
+    if (best_idx < 0)
       break;
 
-    // commit the best merge: replace pair (best_idx, best_idx+1) with best_id
+    // Commit the best merge: replace pair (best_idx, best_idx+1) with best_id
     tokens[best_idx] = best_id;
     pieces[best_idx] = t->vocab[best_id];
+    plens[best_idx] = t->lengths[best_id];
     for (int j = best_idx + 1; j < ntok - 1; j++) {
       tokens[j] = tokens[j + 1];
       pieces[j] = pieces[j + 1];
+      plens[j] = plens[j + 1];
     }
     ntok--;
-    merge_step++;
   }
 
-  // 3) Append EOS if requested.
-  if (eos_id >= 0) {
-    if (ntok < cap)
-      tokens[ntok++] = eos_id;
-  }
+  // 3) Append EOS if requested and space remains
+  if (eos_id >= 0 && ntok < cap)
+    tokens[ntok++] = eos_id;
 
-  // 4) Output (truncate if needed).
+  // 4) Truncate if caller's buffer is smaller
   if (ntok > max_tokens)
     ntok = max_tokens;
   for (int i = 0; i < ntok; i++)
     out[i] = tokens[i];
   *n_out = ntok;
 
-  free(pieces);
   free(tokens);
+  free(pieces);
+  free(plens);
+  free(cat);
 }
 
 static char *decode_piece(Tokenizer *t, int prev_token, int token) {
+  (void)prev_token;
   if (token < 0 || token >= t->vocab_size)
     return "";
-  char *piece = t->vocab[token];
-  // If the token is a byte token, return the byte, else return the string
-  // as-is.
-  unsigned char byte_val;
-  if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
-    // Return the actual byte as a string (not just printable/space)
-    static char buf[2];
-    buf[0] = (char)byte_val;
-    buf[1] = '\0';
-    return buf;
+
+  const char *piece = t->vocab[token];
+  int len = t->lengths[token];
+
+  // Byte token if:
+  //  - single raw byte, OR
+  //  - "<0xHH>" formatted
+  if (len == 1) {
+    // Return as a 1-byte C string
+    static char out[2];
+    out[0] = piece[0];
+    out[1] = '\0';
+    return out;
   }
-  // If the piece is a valid UTF-8 multi-byte string, return as-is
-  return piece;
+
+  unsigned char b;
+  if (parse_hex_byte_token(piece, len, &b)) {
+    // Use per-byte scratch for reentrancy across different bytes
+    return (char *)&t->byte_pieces[(int)b * 2];
+  }
+
+  // Normal string piece (UTF-8 safe as-is)
+  return (char *)piece;
 }
 
 static void safe_printf(const char *s) {
   if (!s || !*s)
     return;
-  // Print all bytes, including non-printable, to support full UTF-8/emoji
+  // The pieces we output are proper NUL-terminated byte strings.
+  // This prints raw bytes without sanitization (emoji/UTF-8 okay).
   fputs(s, stdout);
 }
 
