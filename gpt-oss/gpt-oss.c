@@ -285,7 +285,7 @@ static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
     pieces[i] = t->vocab[tokens[i]];
 
   while (1) {
-    float best_score = -1e30f;
+    float best_score = 1e30f; // Use lowest score (rank) for BPE merges
     int best_idx = -1;
     int best_id = -1;
 
@@ -306,11 +306,17 @@ static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
       int id = find_token_id(t, cat, lsum);
       free(cat);
 
-      if (id >= 0 && t->scores[id] > best_score) {
+      // Skip if not found or is a special token (very negative score)
+      if (id < 0 || t->scores[id] <= -1e29f)
+        continue;
+
+      // Use lowest score (rank) for BPE merges
+      if (t->scores[id] < best_score) {
         best_score = t->scores[id];
         best_idx = i;
         best_id = id;
       }
+      // Tie-break: leftmost (already handled by <)
     }
 
     if (best_idx == -1)

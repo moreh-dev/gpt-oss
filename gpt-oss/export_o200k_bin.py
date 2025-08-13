@@ -93,7 +93,8 @@ def main():
         else:
             b = id_to_bytes[tid]
             s_bytes = b
-            scores[tid] = float(-tid)
+            # Use the BPE rank as the score for mergeable tokens
+            scores[tid] = float(ranks.get(b, tid))
 
         token_bytes_out.append(s_bytes)
         if len(s_bytes) > max_len:
