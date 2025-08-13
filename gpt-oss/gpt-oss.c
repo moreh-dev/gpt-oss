@@ -135,18 +135,23 @@ typedef struct {
 } GPTOSSModel;
 
 // -------------------------------
-// ...existing code...
-
-// -------------------------------
 // Math helpers
 
 static inline void rmsnorm(float *o, const float *x, const float *w, int size) {
+  // DEBUG: Print first few values of x (input to rmsnorm)
+  printf("[DEBUG] rmsnorm x sample: ");
+  for (int j = 0; j < 5 && j < size; j++)
+    printf("%.4f ", x[j]);
+  printf("...\n");
   float ss = 0.0f;
-  for (int i = 0; i < size; i++)
-    ss += x[i] * x[i];
-  ss = 1.0f / sqrtf(ss / size + 1e-5f);
-  for (int i = 0; i < size; i++)
-    o[i] = w[i] * (ss * x[i]);
+  for (int j = 0; j < size; j++)
+    ss += x[j] * x[j];
+  float denom = ss / size + 1e-5f;
+  // DEBUG: Always print ss and denom
+  printf("[DEBUG] rmsnorm: ss=%.6e denom=%.6e\n", ss, denom);
+  ss = 1.0f / sqrtf(denom);
+  for (int j = 0; j < size; j++)
+    o[j] = w[j] * (ss * x[j]);
 }
 
 static inline void softmax_inplace(float *x, int n) {
@@ -168,15 +173,13 @@ static inline void matmul(float *y, const float *x, const float *w, int n,
                           int d) {
   // y(d) = W(d,n) @ x(n)
   for (int i = 0; i < d; i++) {
-    float acc = 0.0f;
-    const float *wrow = w + (size_t)i * n;
+    float sum = 0.0f;
     for (int j = 0; j < n; j++)
-      acc += wrow[j] * x[j];
-    y[i] = acc;
+      sum += w[i * n + j] * x[j];
+    y[i] = sum;
   }
 }
 
-// top-k indices by value (k <= n_experts). O(n*logk) partial insertion sort.
 static inline void topk_indices(const float *x, int n, int k, int *idx,
                                 float *val) {
   for (int i = 0; i < k; i++) {
@@ -318,6 +321,7 @@ static void memory_map_weights(GPTOSSWeights *w, const GPTOSSConfig *p,
 
 // Checkpoint reader (simple mmap). Header must be sizeof(GPTOSSConfig).
 static void read_checkpoint(const char *path, GPTOSSConfig *cfg,
+                            // ...existing code...
                             GPTOSSWeights *w, int *fd, float **data,
                             ssize_t *file_size) {
   FILE *f = fopen(path, "rb");
@@ -346,6 +350,23 @@ static void read_checkpoint(const char *path, GPTOSSConfig *cfg,
   cfg->vocab_size = abs(cfg->vocab_size);
   float *ptr = *data + sizeof(GPTOSSConfig) / sizeof(float);
   memory_map_weights(w, cfg, ptr, shared);
+  // DEBUG: Print model config after loading weights
+  printf("[DEBUG] Model config: dim=%d n_heads=%d n_kv_heads=%d n_layers=%d "
+         "vocab_size=%d seq_len=%d rope_base=%.2f rope_scale=%.2f\n",
+         cfg->dim, cfg->n_heads, cfg->n_kv_heads, cfg->n_layers,
+         cfg->vocab_size, cfg->seq_len, cfg->rope_base, cfg->rope_scale);
+  // DEBUG: Print first few values of tok_embeddings
+  if (w->tok_embeddings) {
+    printf("[DEBUG] tok_embeddings sample: ");
+    for (int i = 0; i < 5 && i < cfg->dim * 2; i++)
+      printf("%.4f ", w->tok_embeddings[i]);
+    printf("...\n");
+  }
+  // Clamp RoPE scaling to sane defaults
+  if (cfg->rope_scale <= 0.0f || !isfinite(cfg->rope_scale))
+    cfg->rope_scale = 1.0f;
+  if (cfg->rope_base <= 100.0f || !isfinite(cfg->rope_base))
+    cfg->rope_base = 10000.0f;
 }
 
 static void build_model(GPTOSSModel *m, const char *checkpoint) {
@@ -399,11 +420,16 @@ static inline void apply_rope_yarn(float *vec, int size, int head_size, int pos,
 // Forward pass
 
 static float *forward(GPTOSSModel *model, int token, int pos) {
+  // DEBUG: Print input token and position
+  printf("[DEBUG] forward: token=%d pos=%d\n", token, pos);
   GPTOSSConfig *p = &model->config;
   GPTOSSWeights *w = &model->weights;
   RunState *s = &model->state;
   const int dim = p->dim;
   const int head_size = dim / p->n_heads;
+  // DEBUG: Print head_size
+  if (head_size <= 0)
+    printf("[DEBUG] WARNING: head_size=%d (should be >0)\n", head_size);
   const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
   // Map each Q head to a KV head. Use modulo so it's valid even when
   // n_heads is not divisible by n_kv_heads.
@@ -411,10 +437,53 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
 
   // token embedding
   memcpy(s->x, w->tok_embeddings + (size_t)token * dim, sizeof(float) * dim);
+  // DEBUG: Print first few values of s->x after token embedding
+  printf("[DEBUG] s->x sample after embedding: ");
+  for (int i = 0; i < 5 && i < dim; i++)
+    printf("%.4f ", s->x[i]);
+  printf("...\n");
 
   for (int l = 0; l < p->n_layers; l++) {
+    // DEBUG: Print norm of q, k, v for first layer
+    if (l == 0) {
+      float qn = 0.0f, kn = 0.0f, vn = 0.0f;
+      for (int i = 0; i < dim; i++)
+        qn += s->q[i] * s->q[i];
+      for (int i = 0; i < kv_dim; i++)
+        kn += s->k[i] * s->k[i];
+      for (int i = 0; i < kv_dim; i++)
+        vn += s->v[i] * s->v[i];
+      printf("[DEBUG] l=0 q_norm=%.2f k_norm=%.2f v_norm=%.2f\n", sqrtf(qn),
+             sqrtf(kn), sqrtf(vn));
+    }
+    // Check for NaN/Inf in s->x before rmsnorm in layer 1
+    if (l == 1) {
+      int nan_count = 0, inf_count = 0;
+      for (int i = 0; i < dim; i++) {
+        if (isnan(s->x[i])) {
+          if (nan_count < 10)
+            printf("[DEBUG] s->x[NaN] idx=%d val=%g\n", i, s->x[i]);
+          nan_count++;
+        }
+        if (isinf(s->x[i])) {
+          if (inf_count < 10)
+            printf("[DEBUG] s->x[Inf] idx=%d val=%g\n", i, s->x[i]);
+          inf_count++;
+        }
+      }
+      printf(
+          "[DEBUG] s->x before rmsnorm (layer 1): NaN count=%d, Inf count=%d\n",
+          nan_count, inf_count);
+    }
     // --- Attention ---
     rmsnorm(s->xb, s->x, w->rms_att_w + (size_t)l * dim, dim);
+    // DEBUG: Print first few values of s->xb after rmsnorm
+    if (l == 0) {
+      printf("[DEBUG] s->xb after rmsnorm: ");
+      for (int i = 0; i < 5 && i < dim; i++)
+        printf("%.4f ", s->xb[i]);
+      printf("...\n");
+    }
 
     // qkv projections (with biases)
     matmul(s->q, s->xb, w->wq + (size_t)l * dim * dim, dim, dim);
@@ -426,12 +495,39 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
       s->k[i] += w->bk[(size_t)l * kv_dim + i];
       s->v[i] += w->bv[(size_t)l * kv_dim + i];
     }
+    // DEBUG: Print first few values of s->q, s->k, s->v after matmul and bias
+    // add, before RoPE
+    if (l == 0) {
+      printf("[DEBUG] s->q after matmul+bias: ");
+      for (int i = 0; i < 5 && i < dim; i++)
+        printf("%.4f ", s->q[i]);
+      printf("...\n");
+      printf("[DEBUG] s->k after matmul+bias: ");
+      for (int i = 0; i < 5 && i < kv_dim; i++)
+        printf("%.4f ", s->k[i]);
+      printf("...\n");
+      printf("[DEBUG] s->v after matmul+bias: ");
+      for (int i = 0; i < 5 && i < kv_dim; i++)
+        printf("%.4f ", s->v[i]);
+      printf("...\n");
+    }
 
     // RoPE with YaRN scaling
     apply_rope_yarn(s->q, dim, head_size, pos, p->rope_base, p->rope_scale,
                     p->seq_len);
     apply_rope_yarn(s->k, kv_dim, head_size, pos, p->rope_base, p->rope_scale,
                     p->seq_len);
+    // DEBUG: Print first few values of s->q and s->k after RoPE
+    if (l == 0) {
+      printf("[DEBUG] s->q after RoPE: ");
+      for (int i = 0; i < 5 && i < dim; i++)
+        printf("%.4f ", s->q[i]);
+      printf("...\n");
+      printf("[DEBUG] s->k after RoPE: ");
+      for (int i = 0; i < 5 && i < kv_dim; i++)
+        printf("%.4f ", s->k[i]);
+      printf("...\n");
+    }
 
     // store k/v in cache for current pos
     size_t loff = (size_t)l * p->seq_len * kv_dim + (size_t)pos * kv_dim;
@@ -440,7 +536,7 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
 
     // Attention window config
     int t_start = 0;
-    if (p->alt_banded && p->window > 0 && (l % 2 == 0)) {
+    if (p->window > 0) {
       int wstart = pos - (p->window - 1);
       if (wstart > 0)
         t_start = wstart;
@@ -453,10 +549,9 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
       float *q = s->q + h * head_size;
       float *att = s->att + (size_t)h * p->seq_len;
 
-      // learned sink logit for this head/layer (can be 0 if NULL)
+      // Temporarily disable learned sink influence to validate logits
       float sink = 0.0f;
-      if (w->attn_sink)
-        sink = w->attn_sink[(size_t)l * p->n_heads + h];
+      (void)w; // silence unused if optimized out
 
       // clear attention scratch for active window before use
       for (int t = t_start; t <= pos; t++) {
@@ -472,21 +567,44 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
           score += q[i] * krow[i];
         att[t] = score / sqrtf((float)head_size);
       }
+      // DEBUG: Print first few attention scores (always for first head/layer)
+      if (h == 0 && l == 0) {
+        printf("[DEBUG] att scores (pre-softmax): ");
+        for (int t = t_start; t <= pos && t < t_start + 5; t++)
+          printf("%.4f ", att[t]);
+        printf("...\n");
+      }
 
-      // softmax over the active window with sink in the denominator
-      float mx = sink;
+      // softmax over the active window, sink disabled
+      float mx = -1e30f;
       for (int t = t_start; t <= pos; t++)
         if (att[t] > mx)
           mx = att[t];
-      float sum = expf(sink - mx); // sink contribution only in denom
+      // DEBUG: Print mx (always for first head/layer)
+      if (h == 0 && l == 0)
+        printf("[DEBUG] mx: %.4f\n", mx);
+      float sum = 0.0f;
       for (int t = t_start; t <= pos; t++) {
         float e = expf(att[t] - mx);
         att[t] = e;
         sum += e;
       }
+      // DEBUG: Print sum (always for first head/layer)
+      if (h == 0 && l == 0)
+        printf("[DEBUG] sum: %.4f\n", sum);
       float inv = 1.0f / sum;
+      // DEBUG: Print inv (always for first head/layer)
+      if (h == 0 && l == 0)
+        printf("[DEBUG] inv: %.4f\n", inv);
       for (int t = t_start; t <= pos; t++)
         att[t] *= inv;
+      // DEBUG: Print att after softmax (always for first head/layer)
+      if (h == 0 && l == 0) {
+        printf("[DEBUG] att (post-softmax): ");
+        for (int t = t_start; t <= pos && t < t_start + 5; t++)
+          printf("%.4f ", att[t]);
+        printf("...\n");
+      }
 
       // weighted sum of values
       float *out = s->xb + h * head_size;
@@ -502,8 +620,71 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
 
     // output projection + bias + residual
     matmul(s->xb2, s->xb, w->wo + (size_t)l * dim * dim, dim, dim);
+    // DEBUG: Print first few values of s->xb2 after output projection
+    if (l == 0) {
+      // Print first few values
+      printf("[DEBUG] s->xb2 after out proj: ");
+      for (int i = 0; i < 5 && i < dim; i++)
+        printf("%.4f ", s->xb2[i]);
+      printf("...\n");
+
+      // Print min, max, mean of s->xb2
+      float min_xb2 = s->xb2[0], max_xb2 = s->xb2[0], sum_xb2 = 0.0f;
+      for (int i = 0; i < dim; i++) {
+        if (s->xb2[i] < min_xb2)
+          min_xb2 = s->xb2[i];
+        if (s->xb2[i] > max_xb2)
+          max_xb2 = s->xb2[i];
+        sum_xb2 += s->xb2[i];
+      }
+      printf("[DEBUG] s->xb2 stats: min=%.6g max=%.6g mean=%.6g\n", min_xb2,
+             max_xb2, sum_xb2 / dim);
+
+      // Print min, max, mean of w->wo (layer 0)
+      float min_wo = w->wo[0], max_wo = w->wo[0], sum_wo = 0.0f;
+      for (int i = 0; i < dim * dim; i++) {
+        if (w->wo[i] < min_wo)
+          min_wo = w->wo[i];
+        if (w->wo[i] > max_wo)
+          max_wo = w->wo[i];
+        sum_wo += w->wo[i];
+      }
+      printf("[DEBUG] w->wo (layer 0) stats: min=%.6g max=%.6g mean=%.6g\n",
+             min_wo, max_wo, sum_wo / (dim * dim));
+
+      // Print min, max, mean of w->bo (layer 0)
+      float min_bo = w->bo[0], max_bo = w->bo[0], sum_bo = 0.0f;
+      for (int i = 0; i < dim; i++) {
+        if (w->bo[i] < min_bo)
+          min_bo = w->bo[i];
+        if (w->bo[i] > max_bo)
+          max_bo = w->bo[i];
+        sum_bo += w->bo[i];
+      }
+      printf("[DEBUG] w->bo (layer 0) stats: min=%.6g max=%.6g mean=%.6g\n",
+             min_bo, max_bo, sum_bo / dim);
+    }
     for (int i = 0; i < dim; i++)
       s->x[i] += s->xb2[i] + w->bo[(size_t)l * dim + i];
+    // DEBUG: Print first few values of s->x after residual+out proj for every
+    // layer
+    printf("[DEBUG] s->x after residual+out proj (layer %d): ", l);
+    for (int i = 0; i < 5 && i < dim; i++)
+      printf("%.4f ", s->x[i]);
+    printf("...\n");
+    if (l == 0) {
+      // Print min, max, mean of s->x after residual+out proj (layer 0)
+      float min_x = s->x[0], max_x = s->x[0], sum_x = 0.0f;
+      for (int i = 0; i < dim; i++) {
+        if (s->x[i] < min_x)
+          min_x = s->x[i];
+        if (s->x[i] > max_x)
+          max_x = s->x[i];
+        sum_x += s->x[i];
+      }
+      printf("[DEBUG] s->x (layer 0) stats: min=%.6g max=%.6g mean=%.6g\n",
+             min_x, max_x, sum_x / dim);
+    }
 
     // --- MoE FFN (top-k) ---
     rmsnorm(s->xb, s->x, w->rms_ffn_w + (size_t)l * dim, dim);
@@ -574,8 +755,27 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
   }
 
   // final rmsnorm + logits
+  // DEBUG: Print s->x and w->rms_final_w before final rmsnorm
+  printf("[DEBUG] s->x before final rmsnorm: ");
+  for (int i = 0; i < 5 && i < dim; i++)
+    printf("%.4f ", s->x[i]);
+  printf("...\n");
+  printf("[DEBUG] w->rms_final_w before final rmsnorm: ");
+  for (int i = 0; i < 5 && i < dim; i++)
+    printf("%.4f ", w->rms_final_w[i]);
+  printf("...\n");
   rmsnorm(s->x, s->x, w->rms_final_w, dim);
+  // DEBUG: Print first few values of s->x after final rmsnorm
+  printf("[DEBUG] s->x after final rmsnorm: ");
+  for (int i = 0; i < 5 && i < dim; i++)
+    printf("%.4f ", s->x[i]);
+  printf("...\n");
   matmul(s->logits, s->x, w->wcls, dim, p->vocab_size);
+  // DEBUG: Print a sample of logits immediately after matmul
+  printf("[DEBUG] logits after matmul: ");
+  for (int i = 0; i < 5 && i < p->vocab_size; i++)
+    printf("%.2f ", s->logits[i]);
+  printf("...\n");
   return s->logits;
 }
 
@@ -658,7 +858,8 @@ int main(int argc, char **argv) {
   printf("BOS token id: %d\n", BOS);
   printf("EOS token id: %d\n", EOS);
 
-  // Encode prompt (only add BOS if we actually found it; don't auto-append EOS)
+  // Encode prompt (only add BOS if we actually found it; don't auto-append
+  // EOS)
   int *tokens = (int *)malloc(sizeof(int) * (model.config.seq_len));
   int ntok = 0;
   encode(&tokenizer, prompt, BOS, -1, tokens, &ntok, model.config.seq_len);

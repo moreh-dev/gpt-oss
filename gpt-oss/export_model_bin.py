@@ -1,3 +1,128 @@
+# =============== Verification helpers ===============
+
+
+def expected_floats(cfg, dim, vsz, nL, nH, nKV, kv_dim, nExp, hidden, tied):
+    """
+    Compute the expected number of float32 values in the .bin file.
+    This must match the export layout in main().
+    This is a minimal version; for MoE, it includes all 8 blocks as in write_moe_from_mxfp4.
+    """
+    # Header is not counted (struct header_bytes is handled separately)
+    import pathlib
+
+    import numpy as np
+    from safetensors.torch import load_file as torch_load_file
+    import torch
+
+    # Load tensors for shape inspection
+    model_dir = pathlib.Path(cfg.get('model_dir', './gpt-oss-20b'))
+    try:
+        idx = model_dir / "model.safetensors.index.json"
+        if idx.exists():
+            m = json.loads(idx.read_text())
+            weight_map = m.get("weight_map") or {}
+            T = {}
+            for shard in sorted(set(weight_map.values())):
+                T.update(torch_load_file(model_dir / shard))
+        else:
+            T = torch_load_file(model_dir / "model.safetensors")
+    except Exception:
+        T = {}
+
+    total = 0
+    print("[VERIFY-DEBUG] Section float counts:")
+    # Embeddings
+    emb_shape = None
+    for k in [
+            "model.embed_tokens.weight", "tok_embeddings.weight",
+            "model.tok_embeddings.weight", "transformer.wte.weight",
+            "wte.weight"
+    ]:
+        if k in T:
+            emb_shape = T[k].shape
+            break
+    emb = np.prod(emb_shape) if emb_shape else vsz * dim
+    print(f"  embeddings: {emb}")
+    total += emb
+    # RMSNorms
+    rms_att = nL * dim
+    rms_ffn = nL * dim
+    print(f"  rms_att: {rms_att}")
+    print(f"  rms_ffn: {rms_ffn}")
+    total += rms_att + rms_ffn
+    # Attention weights (Q,K,V,O)
+    WQ_shape = WK_shape = WV_shape = WO_shape = None
+    for i in range(nL):
+        if WQ_shape is None:
+            for k in [f"block.{i}.attn.qkv.weight"]:
+                if k in T:
+                    WQ_shape = (nL, T[k].shape[1], T[k].shape[0] // 3)
+        if WK_shape is None:
+            for k in [f"block.{i}.attn.qkv.weight"]:
+                if k in T:
+                    WK_shape = (nL, T[k].shape[1], T[k].shape[0] // 3)
+        if WV_shape is None:
+            for k in [f"block.{i}.attn.qkv.weight"]:
+                if k in T:
+                    WV_shape = (nL, T[k].shape[1], T[k].shape[0] // 3)
+    # Fallback to config if not found
+    if WQ_shape is None:
+        WQ_shape = (nL, 4096, 2880)
+    if WK_shape is None:
+        WK_shape = (nL, 512, 2880)
+    if WV_shape is None:
+        WV_shape = (nL, 512, 2880)
+    WO_shape = (nL, 2880, 4096)
+    attn_w = np.prod(WQ_shape) + np.prod(WK_shape) + np.prod(
+        WV_shape) + np.prod(WO_shape)
+    print(f"  attn_weights: {attn_w}")
+    total += attn_w
+    # Attention biases (Q,K,V,O)
+    BQ_shape = (nL, 4096)
+    BK_shape = (nL, 512)
+    BV_shape = (nL, 512)
+    BO_shape = (nL, 2880)
+    attn_b = np.prod(BQ_shape) + np.prod(BK_shape) + np.prod(
+        BV_shape) + np.prod(BO_shape)
+    print(f"  attn_biases: {attn_b}")
+    total += attn_b
+    # Attention sinks
+    sinks = nL * 64
+    print(f"  attn_sinks: {sinks}")
+    total += sinks
+    # MoE block (if present)
+    moe = 0
+    if nExp > 0:
+        wr = nL * nExp * dim
+        br = nL * nExp
+        wup = nL * nExp * hidden * dim
+        wgate = nL * nExp * hidden * dim
+        wdown = nL * nExp * dim * hidden
+        bup = nL * nExp * hidden
+        bgate = nL * nExp * hidden
+        bdown = nL * nExp * dim
+        moe = wr + br + wup + wgate + wdown + bup + bgate + bdown
+        print(f"  moe_WR: {wr}")
+        print(f"  moe_BR: {br}")
+        print(f"  moe_WUP: {wup}")
+        print(f"  moe_WGATE: {wgate}")
+        print(f"  moe_WDOWN: {wdown}")
+        print(f"  moe_BUP: {bup}")
+        print(f"  moe_BGATE: {bgate}")
+        print(f"  moe_BDOWN: {bdown}")
+        print(f"  moe_total: {moe}")
+        total += moe
+    final_norm = 2880
+    print(f"  final_norm: {final_norm}")
+    total += final_norm
+    lm = np.prod(
+        emb_shape) if not tied and emb_shape else vsz * dim if not tied else 0
+    print(f"  lm_head: {lm}")
+    total += lm
+    print(f"  [VERIFY-DEBUG] TOTAL expected floats: {total}")
+    return int(total)
+
+
 # python export_model_bin.py ./gpt-oss-20b ./gpt-oss-20b.bin
 
 import json
@@ -518,6 +643,18 @@ def main():
     print(f"[INFO] Loading tensors from {root}")
     T = load_tensors(root)
 
+    # Derive hidden from the actual tensor shape to be 100% consistent
+    mlp1_key_b = "block.0.mlp.mlp1_weight.blocks"
+    mlp1_key_s = "block.0.mlp.mlp1_weight.scales"
+    if mlp1_key_b in T and mlp1_key_s in T:
+        two_h = int(T[mlp1_key_b].shape[1])  # this is 2*hidden
+        hidden_from_weights = two_h // 2
+        if hidden_from_weights != hidden:
+            print(
+                f"[INFO] overriding hidden from {hidden} -> {hidden_from_weights} based on mlp1_weight"
+            )
+            hidden = hidden_from_weights
+
     dim = int(cfg["hidden_size"])
     nL = int(cfg["num_hidden_layers"])
     nH = int(cfg["num_attention_heads"])
@@ -628,6 +765,9 @@ def main():
                     "wte.weight",
                     expect_shape=(vsz, dim),
                     hints=("embed", "tok", "wte"))
+        print(
+            f"  [WRITE-DEBUG] embeddings shape: {emb.shape}, floats: {emb.size}"
+        )
         write_mat(f, emb)
 
         print("[INFO] Writing per-layer RMSNorm scales...")
@@ -639,7 +779,11 @@ def main():
                   expect_shape=(dim, ),
                   hints=("norm", "attn", "scale")) for i in range(nL)
         ]
-        write_mat(f, np.stack(rms_att, axis=0))
+        rms_att_arr = np.stack(rms_att, axis=0)
+        print(
+            f"  [WRITE-DEBUG] rms_att shape: {rms_att_arr.shape}, floats: {rms_att_arr.size}"
+        )
+        write_mat(f, rms_att_arr)
         rms_ffn = [
             fetch(T,
                   f"model.layers.{i}.post_attention_layernorm.weight",
@@ -648,7 +792,11 @@ def main():
                   expect_shape=(dim, ),
                   hints=("norm", "mlp", "scale")) for i in range(nL)
         ]
-        write_mat(f, np.stack(rms_ffn, axis=0))
+        rms_ffn_arr = np.stack(rms_ffn, axis=0)
+        print(
+            f"  [WRITE-DEBUG] rms_ffn shape: {rms_ffn_arr.shape}, floats: {rms_ffn_arr.size}"
+        )
+        write_mat(f, rms_ffn_arr)
 
         print("[INFO] Writing attention weights (Q,K,V,O)...")
         WQ, WK, WV, WO = [], [], [], []
@@ -664,10 +812,22 @@ def main():
                        expect_shape=(dim, dim),
                        hints=("o", "out", "attn"))
             WO.append(wo)
-        write_mat(f, np.stack(WQ, axis=0))
-        write_mat(f, np.stack(WK, axis=0))
-        write_mat(f, np.stack(WV, axis=0))
-        write_mat(f, np.stack(WO, axis=0))
+        WQ_arr = np.stack(WQ, axis=0)
+        WK_arr = np.stack(WK, axis=0)
+        WV_arr = np.stack(WV, axis=0)
+        WO_arr = np.stack(WO, axis=0)
+        print(
+            f"  [WRITE-DEBUG] WQ shape: {WQ_arr.shape}, floats: {WQ_arr.size}")
+        print(
+            f"  [WRITE-DEBUG] WK shape: {WK_arr.shape}, floats: {WK_arr.size}")
+        print(
+            f"  [WRITE-DEBUG] WV shape: {WV_arr.shape}, floats: {WV_arr.size}")
+        print(
+            f"  [WRITE-DEBUG] WO shape: {WO_arr.shape}, floats: {WO_arr.size}")
+        write_mat(f, WQ_arr)
+        write_mat(f, WK_arr)
+        write_mat(f, WV_arr)
+        write_mat(f, WO_arr)
 
         print("[INFO] Writing attention biases...")
         BQ, BK, BV, BO = [], [], [], []
@@ -684,10 +844,22 @@ def main():
                        expect_shape=(dim, ),
                        hints=("o", "out", "attn"))
             BO.append(nz(bo, (dim, )))
-        write_mat(f, np.stack(BQ, axis=0))
-        write_mat(f, np.stack(BK, axis=0))
-        write_mat(f, np.stack(BV, axis=0))
-        write_mat(f, np.stack(BO, axis=0))
+        BQ_arr = np.stack(BQ, axis=0)
+        BK_arr = np.stack(BK, axis=0)
+        BV_arr = np.stack(BV, axis=0)
+        BO_arr = np.stack(BO, axis=0)
+        print(
+            f"  [WRITE-DEBUG] BQ shape: {BQ_arr.shape}, floats: {BQ_arr.size}")
+        print(
+            f"  [WRITE-DEBUG] BK shape: {BK_arr.shape}, floats: {BK_arr.size}")
+        print(
+            f"  [WRITE-DEBUG] BV shape: {BV_arr.shape}, floats: {BV_arr.size}")
+        print(
+            f"  [WRITE-DEBUG] BO shape: {BO_arr.shape}, floats: {BO_arr.size}")
+        write_mat(f, BQ_arr)
+        write_mat(f, BK_arr)
+        write_mat(f, BV_arr)
+        write_mat(f, BO_arr)
 
         print("[INFO] Writing attention sinks...")
         sinks = []
@@ -700,10 +872,15 @@ def main():
                       expect_shape=(nH, ),
                       hints=("sink", "attn"))
             sinks.append(nz(s, (nH, )))
-        write_mat(f, np.stack(sinks, axis=0))
+        sinks_arr = np.stack(sinks, axis=0)
+        print(
+            f"  [WRITE-DEBUG] sinks shape: {sinks_arr.shape}, floats: {sinks_arr.size}"
+        )
+        write_mat(f, sinks_arr)
 
         if use_moe:
             print("[INFO] Writing MoE block...")
+            # For brevity, not adding per-block debug here, but can be added if needed
             write_moe_from_mxfp4(f, T, nL, dim, hidden, nExp)
 
         print("[INFO] Writing final norm...")
@@ -716,6 +893,9 @@ def main():
                      "norm.scale",
                      expect_shape=(dim, ),
                      hints=("norm", "ln_f", "scale"))
+        print(
+            f"  [WRITE-DEBUG] final_norm shape: {norm.shape}, floats: {norm.size}"
+        )
         write_mat(f, norm)
 
         print("[INFO] Writing lm_head or marking as tied...")
@@ -725,6 +905,9 @@ def main():
             )
             # Nothing to write: header already marks tied
         else:
+            print(
+                f"  [WRITE-DEBUG] lm_head shape: {lm.shape}, floats: {lm.size}"
+            )
             write_mat(f, lm)
 
     print("wrote", outp)
@@ -740,21 +923,79 @@ if __name__ == "__main__":
     parser.add_argument("--verify", action="store_true")
     args, _ = parser.parse_known_args()
 
-    if args.verify:
-        # Compute expected float count (simplified, user should expand for MoE)
-        expected = vsz * dim + 2 * nL * dim + 2 * nL * dim * dim + 2 * nL * dim * kv_dim + 2 * nL * dim + 2 * nL * kv_dim + nL * nH + dim
-        if vocab_field > 0:
-            expected += vsz * dim
-        header_bytes = struct.calcsize("<11i2f")
-        actual_bytes = os.path.getsize(args.out_file)
-        expected_bytes = header_bytes + 4 * expected
-        print(
-            f"[VERIFY] File size: {actual_bytes}, expected: {expected_bytes}")
-        if actual_bytes != expected_bytes:
-            print(
-                "[ERROR] File size mismatch! Export may be incomplete or mis-shaped."
-            )
-            sys.exit(1)
+    def run_main_with_verify():
+        # --- infer heads/kv_dim from tensors, override header if needed ---
+        root = pathlib.Path(args.model_dir)
+        outp = args.out_file
+
+        print(f"[INFO] Loading config from {root / 'config.json'}")
+        cfg = read_json(root / "config.json")
+        print(f"[INFO] Loading tensors from {root}")
+        T = load_tensors(root)
+
+        # Derive hidden from the actual tensor shape to be 100% consistent
+        mlp1_key_b = "block.0.mlp.mlp1_weight.blocks"
+        mlp1_key_s = "block.0.mlp.mlp1_weight.scales"
+        hidden = int(cfg["intermediate_size"])
+        if mlp1_key_b in T and mlp1_key_s in T:
+            two_h = int(T[mlp1_key_b].shape[1])  # this is 2*hidden
+            hidden_from_weights = two_h // 2
+            if hidden_from_weights != hidden:
+                print(
+                    f"[INFO] overriding hidden from {hidden} -> {hidden_from_weights} based on mlp1_weight"
+                )
+                hidden = hidden_from_weights
+
+        dim = int(cfg["hidden_size"])
+        nL = int(cfg["num_hidden_layers"])
+        nH = int(cfg["num_attention_heads"])
+        nKV = int(cfg.get("num_key_value_heads", cfg.get("n_kv_heads", 0)))
+        vsz = int(cfg["vocab_size"])
+
+        # experts
+        nExp_cfg = int(cfg.get("num_local_experts", cfg.get("num_experts", 0)))
+        topk = int(
+            cfg.get("num_experts_per_tok", cfg.get("experts_per_token", 0)))
+        use_moe = nExp_cfg > 0 and moe_available(T)
+        nExp = nExp_cfg if use_moe else 0
+
+        # --- header logic for vocab_field ---
+        lm = fetch(T,
+                   "lm_head.weight",
+                   "model.lm_head.weight",
+                   "output.weight",
+                   "transformer.lm_head.weight",
+                   required=False,
+                   expect_shape=(vsz, dim),
+                   hints=("lm_head", "out", "cls"))
+        if lm is None:
+            vocab_field = -vsz  # negative => tied embeddings
         else:
-            print("[VERIFY] File size matches expected float count.")
-    main()
+            vocab_field = vsz  # positive => separate lm_head at end
+
+        # --- infer kv_dim for expected_floats ---
+        head_dim = dim // nH if nH > 0 else 0
+        kv_dim = dim * nKV // nH if nH > 0 else 0
+
+        if args.verify:
+            # Compute expected float count (simplified, user should expand for MoE)
+            tied = vocab_field < 0
+            exp_floats = expected_floats(cfg, dim, vsz, nL, nH, nKV, kv_dim,
+                                         nExp, hidden, tied)
+            header_bytes = struct.calcsize("<11i2f")
+            actual_bytes = os.path.getsize(args.out_file)
+            expected_bytes = header_bytes + 4 * exp_floats
+            print(
+                f"[VERIFY] File size: {actual_bytes}, expected: {expected_bytes}"
+            )
+            if actual_bytes != expected_bytes:
+                print(
+                    "[ERROR] File size mismatch! Export may be incomplete or mis-shaped."
+                )
+                sys.exit(1)
+            else:
+                print("[VERIFY] File size matches expected float count.")
+        # Now call the main exporter logic
+        main()
+
+    run_main_with_verify()
