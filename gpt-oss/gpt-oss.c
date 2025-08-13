@@ -265,13 +265,9 @@ static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
   int ntok = 0;
   if (bos_id >= 0)
     tokens[ntok++] = bos_id;
-  if (len > 0) {
-    // dummy prefix space like sentencepiece
-    int space = find_token_id(t, " ");
-    if (space >= 0)
-      tokens[ntok++] = space;
-  }
-  // UTF-8 aware accumulation (compatible with llama2.c behavior)
+  // removed dummy prefix space injection (tiktoken-style vocab already has
+  // leading-space tokens) UTF-8 aware accumulation (compatible with llama2.c
+  // behavior)
   size_t str_len = 0;
   char buf[8] = {0};
   for (const char *c = text; *c != '\0'; c++) {
@@ -1007,35 +1003,37 @@ int main(int argc, char **argv) {
                      .topp = topp,
                      .rng_state = seed};
 
-  // Generate
+  // ---- KV warmup: run the ENTIRE prompt through the model WITHOUT printing
   int pos = 0;
   int token = tokens[0];
-  int next = 0;
-  int prev = -1;
-  long start_ms = 0;
-  while (pos < steps) {
+  for (; pos < ntok - 1; pos++) {
+    (void)forward(&model, token, pos);
+    token = tokens[pos + 1];
+  }
+  // Now 'token' is the last prompt token and 'pos == ntok-1'.
+  // We will start sampling from here and print ONLY new tokens.
+
+  // Number of tokens to *generate* (not counting prompt)
+  int to_generate = steps;
+  if (to_generate > model.config.seq_len - ntok)
+    to_generate = model.config.seq_len - ntok;
+
+  // Generate continuation
+  int generated = 0;
+  while (generated < to_generate) {
     float *logits = forward(&model, token, pos);
 
-    if (pos < ntok - 1) {
-      next = tokens[pos + 1];
-    } else {
-      next = sample_next(&sampler, logits);
-    }
-
-    // terminate on EOS if we actually have it
+    int next = sample_next(&sampler, logits);
     if (EOS >= 0 && next == EOS)
       break;
 
-    // print decoded piece based on transition (prev token -> next token)
     char *piece = decode_piece(&tokenizer, token, next);
     safe_printf(piece);
     fflush(stdout);
 
-    prev = token;
     token = next;
     pos++;
-    if (start_ms == 0)
-      start_ms = (long)(clock() * 1000.0 / CLOCKS_PER_SEC);
+    generated++;
   }
   printf("\n");
 
