@@ -259,91 +259,88 @@ static void free_tokenizer(Tokenizer *t) {
 
 static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
                    int *out, int *n_out, int max_tokens) {
-  // Start from raw bytes -> initial token list (each byte -> byte token id)
-  // Inject leading space if not present, to match tiktoken behavior
-  const char *input = text;
-  char *tmp = NULL;
-  int len = (int)strlen(input);
-  int *tokens = (int *)malloc(sizeof(int) * (len + 3));
+  const unsigned char *p = (const unsigned char *)text;
+
+  // 1) Seed from BYTES ONLY: map every input byte -> its byte token.
+  //    (No codepoint probing; matches tiktoken/o200k behavior.)
+  int cap = (int)strlen((const char *)p) + 2; // +BOS/+EOS slack
+  int *tokens = (int *)malloc(sizeof(int) * cap);
   int ntok = 0;
-  if (bos_id >= 0)
+
+  if (bos_id >= 0) {
     tokens[ntok++] = bos_id;
-  // UTF-8 aware accumulation (compatible with llama2.c behavior)
-  size_t str_len = 0;
-  char buf[8] = {0};
-  for (const char *c = input; *c != '\0'; c++) {
-    if (((*c & 0xC0) != 0x80))
-      str_len = 0; // reset at new codepoint
-    buf[str_len++] = *c;
-    buf[str_len] = '\0';
-    if (((*(c + 1) & 0xC0) == 0x80) && str_len < 4)
-      continue;
-
-    int id = find_token_id(t, buf, (int)str_len);
-    if (id >= 0) {
-      tokens[ntok++] = id;
-    } else {
-      for (size_t i = 0; i < str_len; i++) {
-        unsigned char b = (unsigned char)buf[i];
-        int bid = t->byte_tokens[b];
-        if (bid < 0)
-          bid = 0; // <unk>
-        tokens[ntok++] = bid;
-      }
-    }
-    str_len = 0;
   }
-  if (tmp)
-    free(tmp);
 
-  // greedy BPE merges by best score
+  for (; *p; ++p) {
+    int bid = t->byte_tokens[*p];
+    if (bid < 0)
+      bid = 0; // fallback <unk> if somehow missing
+    tokens[ntok++] = bid;
+  }
+
+  // 2) Greedy BPE merges: always pick the highest-score mergeable pair.
+  //    (exporter sets scores = -token_id for normals; specials = -1e30.)
   char **pieces = (char **)malloc(sizeof(char *) * ntok);
   for (int i = 0; i < ntok; i++)
     pieces[i] = t->vocab[tokens[i]];
+
   while (1) {
     float best_score = -1e30f;
     int best_idx = -1;
     int best_id = -1;
+
+    // scan adjacent pairs
     for (int i = 0; i < ntok - 1; i++) {
       const char *a = pieces[i];
       const char *b = pieces[i + 1];
-      size_t la = strlen(a), lb = strlen(b);
-      size_t lsum = la + lb;
-      if ((int)lsum > t->max_token_length)
+      int la = (int)strlen(a), lb = (int)strlen(b);
+      int lsum = la + lb;
+      if (lsum > t->max_token_length)
         continue;
+
       char *cat = (char *)malloc(lsum + 1);
       memcpy(cat, a, la);
       memcpy(cat + la, b, lb);
       cat[lsum] = '\0';
-      int id = find_token_id(t, cat, (int)lsum);
+
+      int id = find_token_id(t, cat, lsum);
       free(cat);
+
       if (id >= 0 && t->scores[id] > best_score) {
         best_score = t->scores[id];
         best_idx = i;
         best_id = id;
       }
     }
+
     if (best_idx == -1)
       break;
+
+    // commit the best merge: replace pair (best_idx, best_idx+1) with best_id
     tokens[best_idx] = best_id;
     pieces[best_idx] = t->vocab[best_id];
     for (int j = best_idx + 1; j < ntok - 1; j++) {
       tokens[j] = tokens[j + 1];
       pieces[j] = pieces[j + 1];
     }
-    ntok -= 1;
+    ntok--;
   }
 
-  int write_n = ntok;
-  if (eos_id >= 0 && write_n < max_tokens)
-    tokens[write_n++] = eos_id;
-  if (write_n > max_tokens)
-    write_n = max_tokens;
-  for (int i = 0; i < write_n; i++)
+  // 3) Append EOS if requested.
+  if (eos_id >= 0) {
+    if (ntok < cap)
+      tokens[ntok++] = eos_id;
+  }
+
+  // 4) Output (truncate if needed).
+  if (ntok > max_tokens)
+    ntok = max_tokens;
+  for (int i = 0; i < ntok; i++)
     out[i] = tokens[i];
-  *n_out = write_n;
-  free(tokens);
+  *n_out = ntok;
+
   free(pieces);
+  free(tokens);
 }
 
 static char *decode_piece(Tokenizer *t, int prev_token, int token) {
