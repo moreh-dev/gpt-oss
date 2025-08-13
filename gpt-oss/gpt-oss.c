@@ -280,26 +280,22 @@ static void read_tokenizer(Tokenizer *t, const char *path, int vocab_size) {
 
   qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
 
-  // Build byte token map for both representations
-  for (int b = 0; b < 256; b++)
-    t->byte_tokens[b] = -1;
-
-  for (int i = 0; i < vocab_size; i++) {
-    const char *s = t->vocab[i];
-    int len = t->lengths[i];
-    unsigned char byte_val;
-
-    if (len == 1) {
-      // raw single-byte token
-      byte_val = (unsigned char)s[0];
-      t->byte_tokens[byte_val] = i;
-    } else if (parse_hex_byte_token(s, len, &byte_val)) {
-      t->byte_tokens[byte_val] = i;
-    }
-  }
-
-  // tiny helpers for decode path (optional)
+  // find byte tokens either as "<0xHH>" or as single literal char
+  char tmp[8];
   for (int b = 0; b < 256; b++) {
+    int id = -1;
+    // textual placeholder
+    snprintf(tmp, sizeof(tmp), "<0x%02X>", b);
+    id = find_token_id(t, tmp, (int)strlen(tmp));
+    // literal single-byte (printable ASCII or common whitespace)
+    if (id < 0) {
+      char one[2] = {(char)b, 0};
+      if (b == 9 || b == 10 || b == 13 || (b >= 32 && b <= 126)) {
+        id = find_token_id(t, one, 1);
+      }
+    }
+    t->byte_tokens[b] = id;
+    // also prepare raw single-byte decode
     t->byte_pieces[b * 2] = (unsigned char)b;
     t->byte_pieces[b * 2 + 1] = '\0';
   }

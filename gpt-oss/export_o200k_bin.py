@@ -95,6 +95,7 @@ def build_token_records(
     for tid in range(n_vocab):
         special_text = id_to_text[tid]
         if special_text is not None:
+            # Special tokens: store UTF-8 *text* so the C side can match them by name
             data = special_text.encode("utf-8", errors="strict")
             score = SPECIAL_TOKEN_SCORE
         else:
@@ -103,7 +104,18 @@ def build_token_records(
                 raise RuntimeError(
                     f"Token id {tid} unresolved: missing bytes and special text."
                 )
-            data = token_bytes
+
+            # === IMPORTANT: store RAW BYTES for normal tokens ===
+            # This makes the C BPE concatenate bytes and hit the exact entries.
+            # Only special-case the true NUL byte (rare / unused in UTF-8 text),
+            # which cannot live inside C strings safely.
+            if len(token_bytes) == 1 and token_bytes[0] == 0x00:
+                data = b"<0x00>"  # harmless stand-in; won't affect UTF-8 inputs
+            else:
+                data = token_bytes
+
+            # Score encodes merge priority (lower rank = earlier merge).
+            # Keep as the rank float; the C side will interpret consistently.
             score = float(merge_ranks.get(token_bytes, tid))
 
         records.append(TokenRecord(score=score, data=data))
