@@ -173,24 +173,10 @@ static int compare_tokens(const void *a, const void *b) {
 }
 
 static int find_token_id(Tokenizer *t, const char *s, int len) {
-  // binary search in sorted_vocab
-  int lo = 0, hi = t->vocab_size - 1;
-  while (lo <= hi) {
-    int mid = (lo + hi) >> 1;
-    int cmp =
-        memcmp(t->sorted_vocab[mid].str, s,
-               len < t->sorted_vocab[mid].len ? len : t->sorted_vocab[mid].len);
-    if (cmp == 0) {
-      if (len == t->sorted_vocab[mid].len)
-        return t->sorted_vocab[mid].id;
-      cmp = len - t->sorted_vocab[mid].len;
-    }
-    if (cmp < 0)
-      lo = mid + 1;
-    else
-      hi = mid - 1;
-  }
-  return -1;
+  TokenIndex key = {.str = s, .len = len, .id = -1};
+  TokenIndex *res = (TokenIndex *)bsearch(&key, t->sorted_vocab, t->vocab_size,
+                                          sizeof(TokenIndex), compare_tokens);
+  return res ? res->id : -1;
 }
 
 static void read_tokenizer(Tokenizer *t, const char *path, int vocab_size) {
