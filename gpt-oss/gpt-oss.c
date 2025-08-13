@@ -381,7 +381,9 @@ static inline void apply_rope_yarn(float *vec, int size, int head_size, int pos,
   if (s <= 0.0f)
     s = 1.0f;
   if (s > 1024.0f)
-    s = 1024.0f; // sanity clamp for extreme configs
+    s = 1024.0f;
+  float concentration = (s > 1.0f) ? (1.0f + 0.1f * logf(s)) : 1.0f;
+
   for (int i = 0; i < size; i += 2) {
     int j = (i % head_size) >> 1;
     float inv_freq = powf(rope_base, -(2.0f * (float)j) / (float)head_size);
@@ -392,8 +394,8 @@ static inline void apply_rope_yarn(float *vec, int size, int head_size, int pos,
     float angle = (float)pos * (m * inv_freq);
     float c = cosf(angle), sd = sinf(angle);
     float v0 = vec[i], v1 = vec[i + 1];
-    vec[i] = v0 * c - v1 * sd;
-    vec[i + 1] = v0 * sd + v1 * c;
+    vec[i] = concentration * (v0 * c - v1 * sd);     // <- scale
+    vec[i + 1] = concentration * (v0 * sd + v1 * c); // <- scale
   }
 }
 
@@ -442,7 +444,8 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
 
     // Attention window config
     int t_start = 0;
-    if (p->window > 0) {
+    int apply_window = (p->window > 0) ? ((l % 2) == 0) : 0; // even layers only
+    if (apply_window) {
       int wstart = pos - (p->window - 1);
       if (wstart > 0)
         t_start = wstart;
@@ -456,7 +459,6 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
       float *att = s->att + (size_t)h * p->seq_len;
 
       // Temporarily disable learned sink influence to validate logits
-      float sink = 0.0f;
       (void)w; // silence unused if optimized out
 
       // clear attention scratch for active window before use
@@ -485,9 +487,15 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
         att[t] = e;
         sum += e;
       }
+      // add learned sink as an extra column in softmax (denominator only)
+      float sink =
+          w->attn_sink[(size_t)l * p->n_heads + h]; // BF16 in PT, fp32 here
+      sum += expf(sink - mx);
+
       float inv = 1.0f / sum;
       for (int t = t_start; t <= pos; t++)
         att[t] *= inv;
+      // (no contribution to numerator -> nothing to add to 'out' from sink)
 
       // weighted sum of values
       float *out = s->xb + h * head_size;
@@ -550,12 +558,26 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
           s->hb2[i] += w->b_gate[bg_off + i];
 
         // SwiGLU (standard)
+        const float alpha = 1.702f;
+        const float limit = 7.0f; // matches ModelConfig.swiglu_limit
+
         for (int i = 0; i < p->hidden_dim; i++) {
-          float v = s->hb[i];
-          v *= (1.0f / (1.0f + expf(-v)));
-          v *= s->hb2[i];
-          s->hb[i] = v;
+          float xg = s->hb[i];  // GLU branch
+          float xl = s->hb2[i]; // linear branch
+
+          // clamp like the PT code
+          if (xg > limit)
+            xg = limit; // max only
+          if (xl > limit)
+            xl = limit; // both sides
+          if (xl < -limit)
+            xl = -limit;
+
+          // swiglu with alpha and extra +1 bias on linear branch
+          float sw = xg * (1.0f / (1.0f + expf(-alpha * xg)));
+          s->hb[i] = sw * (xl + 1.0f);
         }
+
         // down-projection + bias -> tmp into xb
         matmul(s->xb, s->hb, w->w_down + down_off, p->hidden_dim, p->dim);
         for (int i = 0; i < p->dim; i++)
@@ -672,11 +694,14 @@ int main(int argc, char **argv) {
   // Sampler
   Sampler sampler = {.vocab_size = model.config.vocab_size};
 
-  // ---- KV warmup: run the ENTIRE prompt through the model WITHOUT printing
+  // ---- KV warmup: run the ENTIRE prompt through the model
   int pos = 0;
   int token = tokens[0];
   for (; pos < ntok - 1; pos++) {
     (void)forward(&model, token, pos);
+    char *piece = decode_piece(&tokenizer, token, tokens[pos + 1]);
+    safe_printf(piece);
+    fflush(stdout);
     token = tokens[pos + 1];
   }
   // Now 'token' is the last prompt token and 'pos == ntok-1'.
