@@ -5,16 +5,16 @@ CC = gcc
 .PHONY: gpt-oss gpt-oss-debug gpt-oss-fast clean
 
 
-gpt-oss: gpt-oss.c tokenizer.c tokenizer.h
-	$(CC) -O3 -o gpt-oss gpt-oss.c tokenizer.c -lm
+gpt-oss: gpt_oss_main.c tokenizer.c tokenizer.h
+	$(CC) -O3 -o gpt-oss gpt_oss_main.c tokenizer.c -lm
 
 
-gpt-oss-debug: gpt-oss.c tokenizer.c tokenizer.h
-	$(CC) -g -o gpt-oss gpt-oss.c tokenizer.c -lm
+gpt-oss-debug: gpt_oss_main.c tokenizer.c tokenizer.h
+	$(CC) -g -o gpt-oss gpt_oss_main.c tokenizer.c -lm
 
 
-gpt-oss-fast: gpt-oss.c tokenizer.c tokenizer.h
-	$(CC) -Ofast -o gpt-oss gpt-oss.c tokenizer.c -lm
+gpt-oss-fast: gpt_oss_main.c tokenizer.c tokenizer.h
+	$(CC) -Ofast -o gpt-oss gpt_oss_main.c tokenizer.c -lm
 
 # Build test_tokenizer
 test_tokenizer: test_tokenizer.c tokenizer.c tokenizer.h
