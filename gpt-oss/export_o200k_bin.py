@@ -1,98 +1,126 @@
+#!/usr/bin/env python3
 import argparse
-import json
 from pathlib import Path
 import struct
 import sys
 
 try:
     import tiktoken
-except Exception as e:
+except Exception:
     print(
         "ERROR: this script requires the 'tiktoken' package.\n"
         "Install it with: pip install --upgrade tiktoken",
-        file=sys.stderr)
+        file=sys.stderr,
+    )
     raise
 
 
+def is_printable_ascii_byte(b: int) -> bool:
+    # printable or whitespace that won't break display
+    return (32 <= b <= 126) or b in (9, 10, 13)
+
+
 def main():
-    ap = argparse.ArgumentParser(
-        description=
-        "Export o200k_harmony tokenizer.bin for llama2.c-style C runtimes")
+    ap = argparse.ArgumentParser()
     ap.add_argument("-o",
                     "--out",
-                    type=Path,
                     required=True,
-                    help="Output tokenizer.bin")
+                    help="Output tokenizer.bin path")
     ap.add_argument("--encoding",
                     default="o200k_harmony",
-                    help="Tiktoken encoding name (default: o200k_harmony)")
-    ap.add_argument("--check-vocab",
-                    type=int,
-                    default=None,
-                    help="Optional expected vocab size (e.g., 201088)")
+                    help="Tiktoken encoding name")
+    ap.add_argument(
+        "--check-vocab",
+        type=int,
+        default=None,
+        help="Optional expected vocab size (e.g., 201088)",
+    )
     args = ap.parse_args()
 
     enc = tiktoken.get_encoding(args.encoding)
+
+    # Mergeable (normal) tokens: bytes -> rank (rank == token_id for non-specials)
+    ranks = enc._mergeable_ranks  # {bytes: int}
+    # Special tokens: str -> id
+    special = enc._special_tokens  # {str: int}
 
     n_vocab = enc.n_vocab
     if args.check_vocab is not None and n_vocab != args.check_vocab:
         print(
             f"WARNING: encoding reports vocab_size={n_vocab}, but --check-vocab={args.check_vocab}",
-            file=sys.stderr)
+            file=sys.stderr,
+        )
 
-    # Build per-token "score" based on merge ranks, like Karpathy's tokenizer.bin
-    # Tiktoken exposes mergeable_ranks: dict[bytes, int rank], lower=more basic; we invert so higher score wins merges.
-    mergeable_ranks = getattr(enc, "mergeable_ranks", None)
-    if mergeable_ranks is None:
-        # Newer tiktoken uses ._mergeable_ranks (private) but keep a fallback.
-        mergeable_ranks = getattr(enc, "_mergeable_ranks", None)
-    if mergeable_ranks is None:
-        print(
-            "ERROR: Could not access mergeable_ranks on tiktoken encoding; please upgrade tiktoken.",
-            file=sys.stderr)
-        sys.exit(1)
+    # Build id -> bytes/str
+    id_to_bytes = [None] * n_vocab  # bytes for normal tokens
+    id_to_text = [None] * n_vocab  # str for specials or <0xHH> substitutions
 
-    # Precompute token byte strings via tiktoken; use decode_single_token_bytes to avoid decode errors.
-    token_bytes = [enc.decode_single_token_bytes(i) for i in range(n_vocab)]
+    # Normal tokens
+    for b, rank in ranks.items():
+        if rank < 0 or rank >= n_vocab:
+            continue
+        id_to_bytes[rank] = b
 
-    # tiktoken: smaller rank => higher priority merge.
-    # Our C encoder picks the *largest* score, so invert rank: score = -rank.
-    MIN_SCORE = -1e10
+    # Special tokens
+    for s, tid in special.items():
+        if 0 <= tid < n_vocab:
+            id_to_text[tid] = s
 
-    scores = [MIN_SCORE] * n_vocab
+    # Fill any missing entries defensively using tiktoken decode
+    for tid in range(n_vocab):
+        if id_to_bytes[tid] is None and id_to_text[tid] is None:
+            try:
+                id_to_bytes[tid] = enc.decode_single_token_bytes(tid)
+            except Exception:
+                # If decode bytes fails, try to find matching special by id
+                for s, sid in special.items():
+                    if sid == tid:
+                        id_to_text[tid] = s
+                        break
 
-    # Build a reverse map: token_id -> rank if mergeable
-    # mergeable_ranks maps byte sequences to rank; we can map those to ids by encoding back
-    # Safer: iterate all ids, look up their byte sequence in mergeable_ranks
-    for tid, b in enumerate(token_bytes):
-        r = mergeable_ranks.get(b)
-        if r is not None:
-            scores[tid] = -float(r)
-
-    # Prepare BYTES for each token. We store literal bytes so the C BPE can
-    # concatenate and look them up. Only special-case the null byte (0x00),
-    # which cannot appear inside a C string (strcmp stops at NUL).
+    # Prepare output token bytes and scores
     token_bytes_out = []
+    scores = [0.0] * n_vocab
     max_len = 0
-    for b in token_bytes:
-        if len(b) == 1 and b[0] == 0x00:
-            s_bytes = b"<0x00>"  # safe C-string stand-in
+
+    for tid in range(n_vocab):
+        s_bytes = None
+        if id_to_text[tid] is not None:
+            # special token: write its literal text as bytes
+            s_bytes = id_to_text[tid].encode("utf-8", errors="strict")
+            # keep score small so merges never prefer a special accidentally
+            scores[tid] = -1e30
         else:
-            s_bytes = b  # literal bytes for everything else
+            b = id_to_bytes[tid]
+            if b is None:
+                # Shouldn't happen, but keep file consistent
+                b = b""  # empty
+            # For single non-printable byte, substitute <0xHH> text that C expects
+            if len(b) == 1 and not is_printable_ascii_byte(b[0]):
+                s_bytes = f"<0x{b[0]:02X}>".encode("ascii")
+            else:
+                s_bytes = b
+            # Score: invert rank so larger is better (C picks max score)
+            scores[tid] = float(-tid)
+
         token_bytes_out.append(s_bytes)
         if len(s_bytes) > max_len:
             max_len = len(s_bytes)
 
-    with args.out.open("wb") as f:
-        # write max_token_length (in BYTES)
+    # Write binary file:
+    # [int max_token_length]
+    # then for each token id 0..n-1:
+    #   [float score][int len][raw bytes]
+    out_path = Path(args.out)
+    with out_path.open("wb") as f:
         f.write(struct.pack("i", max_len))
-        # then for each token: float score, int len, raw bytes
         for tid, s_bytes in enumerate(token_bytes_out):
             f.write(struct.pack("f", scores[tid]))
             f.write(struct.pack("i", len(s_bytes)))
             f.write(s_bytes)
+
     print(
-        f"Wrote tokenizer with {n_vocab} tokens to {args.out} (max_token_length={max_len})"
+        f"Wrote tokenizer with {n_vocab} tokens to {out_path} (max_token_length={max_len})"
     )
 
 

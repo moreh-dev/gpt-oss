@@ -263,13 +263,6 @@ static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
   // Inject leading space if not present, to match tiktoken behavior
   const char *input = text;
   char *tmp = NULL;
-  if (text[0] != ' ') {
-    size_t n = strlen(text);
-    tmp = (char *)malloc(n + 2);
-    tmp[0] = ' ';
-    memcpy(tmp + 1, text, n + 1);
-    input = tmp;
-  }
   int len = (int)strlen(input);
   int *tokens = (int *)malloc(sizeof(int) * (len + 3));
   int ntok = 0;
