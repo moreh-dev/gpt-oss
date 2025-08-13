@@ -197,8 +197,13 @@ def infer_heads_from_fused_qkv(T, i, dim):
         raise ValueError(
             f"layer {i}: unexpected fused qkv rows={rows}, dim={dim}")
     kv_dim_fused = (rows - dim) // 2
-    if dim + 2*kv_dim_fused != rows:
-        raise ValueError(f"layer {i}: fused rows don't split as dim + 2*kv ({rows} vs {dim}+2*{kv_dim_fused})")
+    if dim + 2 * kv_dim_fused != rows:
+        raise ValueError(
+            f"layer {i}: fused rows don't split as dim + 2*kv ({rows} vs {dim}+2*{kv_dim_fused})"
+        )
+        raise ValueError(
+            f"layer {i}: fused rows don't split as dim + 2*kv ({rows} vs {dim}+2*{kv_dim_fused})"
+        )
     hd = gcd(dim, kv_dim_fused)
     if hd <= 0 or (dim % hd) or (kv_dim_fused % hd):
         raise ValueError(
@@ -588,6 +593,12 @@ def main():
     #     vocab_size, seq_len, window, alt_banded; float rope_base, rope_scale
 
     # Decide if we have a separate lm_head before writing header
+    # Print resolved head info for user clarity
+    head_dim = dim // nH if nH > 0 else 0
+    kv_dim = dim * nKV // nH if nH > 0 else 0
+    print(
+        f"[INFO] Resolved heads: n_heads={nH}, n_kv_heads={nKV}, head_dim={head_dim}, kv_dim={kv_dim}"
+    )
     lm = fetch(T,
                "lm_head.weight",
                "model.lm_head.weight",
@@ -599,7 +610,7 @@ def main():
     if lm is None:
         vocab_field = -vsz  # negative => tied embeddings
     else:
-        vocab_field = vsz   # positive => separate lm_head at end
+        vocab_field = vsz  # positive => separate lm_head at end
     hdr = struct.pack("<11i2f", dim, hidden, nL, nH, nKV, nExp, topk,
                       vocab_field, seql, win, alt, ropeB, ropeS)
 
@@ -709,7 +720,9 @@ def main():
 
         print("[INFO] Writing lm_head or marking as tied...")
         if lm is None:
-            print("[INFO] No separate lm_head found — exporting with TIED embeddings")
+            print(
+                "[INFO] No separate lm_head found — exporting with TIED embeddings"
+            )
             # Nothing to write: header already marks tied
         else:
             write_mat(f, lm)
@@ -718,4 +731,30 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    import os
+    import sys
+    parser = argparse.ArgumentParser()
+    parser.add_argument("model_dir")
+    parser.add_argument("out_file")
+    parser.add_argument("--verify", action="store_true")
+    args, _ = parser.parse_known_args()
+
+    if args.verify:
+        # Compute expected float count (simplified, user should expand for MoE)
+        expected = vsz * dim + 2 * nL * dim + 2 * nL * dim * dim + 2 * nL * dim * kv_dim + 2 * nL * dim + 2 * nL * kv_dim + nL * nH + dim
+        if vocab_field > 0:
+            expected += vsz * dim
+        header_bytes = struct.calcsize("<11i2f")
+        actual_bytes = os.path.getsize(args.out_file)
+        expected_bytes = header_bytes + 4 * expected
+        print(
+            f"[VERIFY] File size: {actual_bytes}, expected: {expected_bytes}")
+        if actual_bytes != expected_bytes:
+            print(
+                "[ERROR] File size mismatch! Export may be incomplete or mis-shaped."
+            )
+            sys.exit(1)
+        else:
+            print("[VERIFY] File size matches expected float count.")
     main()

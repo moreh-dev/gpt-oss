@@ -380,6 +380,8 @@ static inline void apply_rope_yarn(float *vec, int size, int head_size, int pos,
     s = 1.0f;
   if (s > 1024.0f)
     s = 1024.0f; // sanity clamp for extreme configs
+  if (s > 1024.0f)
+    s = 1024.0f; // sanity clamp for extreme configs
   for (int i = 0; i < size; i += 2) {
     int j = (i % head_size) >> 1;
     float inv_freq = powf(rope_base, -(2.0f * (float)j) / (float)head_size);
@@ -477,6 +479,9 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
         if (att[t] > mx)
           mx = att[t];
       float sum = expf(sink - mx); // sink contribution only in denom
+      for (int t = t_start; t <= pos; t++) {
+        att[t] = 0.0f; // zero scratch before use
+      }
       for (int t = t_start; t <= pos; t++) {
         float e = expf(att[t] - mx);
         att[t] = e;

@@ -1,0 +1,136 @@
+Source: original/
+Config (mixed schema):
+  dim=2880, hidden_dim=2880, n_layers=24, n_heads=64, n_kv_heads=8
+  n_experts=0, top_k=4, vocab=201088, seq_len=4096, window=128
+  rope_base=150000.0, rope_scale=1.0, alt_banded=1
+  kv_dim = 360
+
+Total tensors: 363
+First 40 keys:
+  block.0.attn.norm.scale                                      (2880,) bfloat16
+  block.0.attn.out.bias                                        (2880,) bfloat16
+  block.0.attn.out.weight                                      (2880, 4096) bfloat16
+  block.0.attn.qkv.bias                                        (5120,) bfloat16
+  block.0.attn.qkv.weight                                      (5120, 2880) bfloat16
+  block.0.attn.sinks                                           (64,) bfloat16
+  block.0.mlp.gate.bias                                        (32,) bfloat16
+  block.0.mlp.gate.weight                                      (32, 2880) bfloat16
+  block.0.mlp.mlp1_bias                                        (32, 5760) bfloat16
+  block.0.mlp.mlp1_weight.blocks                               (32, 5760, 90, 16) uint8
+  block.0.mlp.mlp1_weight.scales                               (32, 5760, 90) uint8
+  block.0.mlp.mlp2_bias                                        (32, 2880) bfloat16
+  block.0.mlp.mlp2_weight.blocks                               (32, 2880, 90, 16) uint8
+  block.0.mlp.mlp2_weight.scales                               (32, 2880, 90) uint8
+  block.0.mlp.norm.scale                                       (2880,) bfloat16
+  block.1.attn.norm.scale                                      (2880,) bfloat16
+  block.1.attn.out.bias                                        (2880,) bfloat16
+  block.1.attn.out.weight                                      (2880, 4096) bfloat16
+  block.1.attn.qkv.bias                                        (5120,) bfloat16
+  block.1.attn.qkv.weight                                      (5120, 2880) bfloat16
+  block.1.attn.sinks                                           (64,) bfloat16
+  block.1.mlp.gate.bias                                        (32,) bfloat16
+  block.1.mlp.gate.weight                                      (32, 2880) bfloat16
+  block.1.mlp.mlp1_bias                                        (32, 5760) bfloat16
+  block.1.mlp.mlp1_weight.blocks                               (32, 5760, 90, 16) uint8
+  block.1.mlp.mlp1_weight.scales                               (32, 5760, 90) uint8
+  block.1.mlp.mlp2_bias                                        (32, 2880) bfloat16
+  block.1.mlp.mlp2_weight.blocks                               (32, 2880, 90, 16) uint8
+  block.1.mlp.mlp2_weight.scales                               (32, 2880, 90) uint8
+  block.1.mlp.norm.scale                                       (2880,) bfloat16
+  block.10.attn.norm.scale                                     (2880,) bfloat16
+  block.10.attn.out.bias                                       (2880,) bfloat16
+  block.10.attn.out.weight                                     (2880, 4096) bfloat16
+  block.10.attn.qkv.bias                                       (5120,) bfloat16
+  block.10.attn.qkv.weight                                     (5120, 2880) bfloat16
+  block.10.attn.sinks                                          (64,) bfloat16
+  block.10.mlp.gate.bias                                       (32,) bfloat16
+  block.10.mlp.gate.weight                                     (32, 2880) bfloat16
+  block.10.mlp.mlp1_bias                                       (32, 5760) bfloat16
+  block.10.mlp.mlp1_weight.blocks                              (32, 5760, 90, 16) uint8
+
+MXFP4 base keys (have .blocks + .scales):
+  block.0.mlp.mlp1_weight
+  block.0.mlp.mlp2_weight
+  block.1.mlp.mlp1_weight
+  block.1.mlp.mlp2_weight
+  block.10.mlp.mlp1_weight
+  block.10.mlp.mlp2_weight
+  block.11.mlp.mlp1_weight
+  block.11.mlp.mlp2_weight
+  block.12.mlp.mlp1_weight
+  block.12.mlp.mlp2_weight
+  block.13.mlp.mlp1_weight
+  block.13.mlp.mlp2_weight
+  block.14.mlp.mlp1_weight
+  block.14.mlp.mlp2_weight
+  block.15.mlp.mlp1_weight
+  block.15.mlp.mlp2_weight
+  block.16.mlp.mlp1_weight
+  block.16.mlp.mlp2_weight
+  block.17.mlp.mlp1_weight
+  block.17.mlp.mlp2_weight
+  block.18.mlp.mlp1_weight
+  block.18.mlp.mlp2_weight
+  block.19.mlp.mlp1_weight
+  block.19.mlp.mlp2_weight
+  block.2.mlp.mlp1_weight
+  block.2.mlp.mlp2_weight
+  block.20.mlp.mlp1_weight
+  block.20.mlp.mlp2_weight
+  block.21.mlp.mlp1_weight
+  block.21.mlp.mlp2_weight
+  block.22.mlp.mlp1_weight
+  block.22.mlp.mlp2_weight
+  block.23.mlp.mlp1_weight
+  block.23.mlp.mlp2_weight
+  block.3.mlp.mlp1_weight
+  block.3.mlp.mlp2_weight
+  block.4.mlp.mlp1_weight
+  block.4.mlp.mlp2_weight
+  block.5.mlp.mlp1_weight
+  block.5.mlp.mlp2_weight
+  block.6.mlp.mlp1_weight
+  block.6.mlp.mlp2_weight
+  block.7.mlp.mlp1_weight
+  block.7.mlp.mlp2_weight
+  block.8.mlp.mlp1_weight
+  block.8.mlp.mlp2_weight
+  block.9.mlp.mlp1_weight
+  block.9.mlp.mlp2_weight
+
+Detected candidates by shape:
+  embeddings_2d_vocab_dim:
+    - embedding.weight
+    - unembedding.weight
+  rms_att_w_L_dim:
+  rms_ffn_w_L_dim:
+  wq_L_dim_dim:
+  wk_L_dim_kv:
+  wv_L_dim_kv:
+  wo_L_dim_dim:
+  bq_L_dim:
+  bk_L_kv:
+  bv_L_kv:
+  bo_L_dim:
+  attn_sink_L_heads:
+  rms_final_dim:
+    - block.0.attn.norm.scale
+    - block.0.mlp.norm.scale
+    - block.1.attn.norm.scale
+    - block.1.mlp.norm.scale
+    - block.10.attn.norm.scale
+    - block.10.mlp.norm.scale
+    - block.11.attn.norm.scale
+    - block.11.mlp.norm.scale
+    - block.12.attn.norm.scale
+    - block.12.mlp.norm.scale
+    - block.13.attn.norm.scale
+    - block.13.mlp.norm.scale
+    - block.14.attn.norm.scale
+    - block.14.mlp.norm.scale
+    - block.15.attn.norm.scale
+    - block.15.mlp.norm.scale
+    - block.16.attn.norm.scale
+    - block.16.mlp.norm.scale
+    - block.17.attn.norm.scale
+    - block.17.mlp.norm.scale
