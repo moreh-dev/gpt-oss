@@ -180,16 +180,22 @@ def decode_mxfp4(
 # =============== Attention helpers ===============
 
 
-def infer_kv_from_fused_qkv(T: Dict[str, torch.Tensor], i: int, dim: int,
-                            nH: int) -> Tuple[int, int]:
-    name = f"block.{i}.attn.qkv.weight"
-    if name not in T: return -1, -1
-    out_dim = T[name].shape[0]  # rows of fused
-    if out_dim < dim or (out_dim - dim) % 2 != 0: return -1, -1
-    kv_dim = (out_dim - dim) // 2
+def infer_kv_from_fused_qkv_strict(T, i, dim, nH):
+    key = f"block.{i}.attn.qkv.weight"
+    if key not in T:  # sharded HF path may not have fused qkv
+        return None
+    out_rows = int(T[key].shape[0])
+    if out_rows <= dim or (out_rows - dim) % 2 != 0:
+        raise ValueError(
+            f"layer {i}: unexpected fused qkv rows={out_rows}, dim={dim}")
+    kv_dim_fused = (out_rows - dim) // 2
     head_dim = dim // nH
-    nKV = kv_dim // head_dim if kv_dim % head_dim == 0 else -1
-    return kv_dim, nKV
+    if kv_dim_fused % head_dim != 0:
+        raise ValueError(
+            f"fused kv_dim={kv_dim_fused} not multiple of head_dim={head_dim} "
+            f"(rows={out_rows}, dim={dim}, n_heads={nH})")
+    nKV_infer = kv_dim_fused // head_dim
+    return kv_dim_fused, nKV_infer
 
 
 def split_fused_qkv(fused: np.ndarray, dim: int, kv_dim: int, i: int):
@@ -499,15 +505,29 @@ def main():
         raise ValueError(f"hidden_size {dim} not divisible by n_heads {nH}")
     head_dim = dim // nH
 
-    # infer kv from fused qkv if needed
-    kv_dim_infer, nKV_infer = infer_kv_from_fused_qkv(T, 0, dim, nH)
-    if kv_dim_infer > 0:
-        if nKV_infer > 0 and nKV_infer != nKV:
-            print(f"[INFO] overriding n_kv_heads: {nKV} -> {nKV_infer}")
+    # infer kv from fused qkv if needed (strict version)
+    head_dim = dim // nH
+    res = infer_kv_from_fused_qkv_strict(T, 0, dim, nH)
+    if res is not None:
+        kv_dim_fused, nKV_infer = res
+        if nKV != nKV_infer:
+            print(
+                f"[INFO] overriding n_kv_heads: {nKV} -> {nKV_infer} to match fused QKV"
+            )
             nKV = nKV_infer
-        kv_dim = kv_dim_infer
+        kv_dim = head_dim * nKV  # = kv_dim_fused
     else:
-        kv_dim = dim * nKV // nH
+        # HF separate q/k/v path; infer from K shape if present
+        k0 = find_by_names(T, "model.layers.0.self_attn.k_proj.weight",
+                           "model.layers.0.attn.k_proj.weight")
+        if k0:
+            kv_dim = int(T[k0].shape[0])
+            if kv_dim % head_dim != 0:
+                raise ValueError(
+                    f"K rows {kv_dim} not multiple of head_dim {head_dim}")
+            nKV = kv_dim // head_dim
+        else:
+            kv_dim = dim * nKV // nH  # last resort, but header & shapes must agree
 
     # detect MoE (MXFP4 present)
     use_moe = nExp_cfg > 0 and moe_available(T)
