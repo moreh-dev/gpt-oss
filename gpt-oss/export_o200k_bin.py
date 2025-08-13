@@ -55,8 +55,8 @@ def main():
     # Precompute token byte strings via tiktoken; use decode_single_token_bytes to avoid decode errors.
     token_bytes = [enc.decode_single_token_bytes(i) for i in range(n_vocab)]
 
-    # Highest rank should have highest score (for greedy merge). We'll use score = rank (float).
-    # For tokens not present in mergeable_ranks (e.g., special tokens), set a very low score so they never win merges.
+    # tiktoken: smaller rank => higher priority merge.
+    # Our C encoder picks the *largest* score, so invert rank: score = -rank.
     MIN_SCORE = -1e10
 
     scores = [MIN_SCORE] * n_vocab
@@ -67,9 +67,7 @@ def main():
     for tid, b in enumerate(token_bytes):
         r = mergeable_ranks.get(b)
         if r is not None:
-            # Higher score should be preferred; tiktoken ranks are 0..N-1 with lower meaning more basic.
-            # We'll invert with a large constant so that later merges have higher scores.
-            scores[tid] = float(r)
+            scores[tid] = -float(r)
 
     # Prepare string forms for each token. For raw byte tokens (single byte), use "<0x%02X>"
     token_strs = []

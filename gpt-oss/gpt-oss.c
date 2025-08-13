@@ -351,8 +351,6 @@ static char *decode_piece(Tokenizer *t, int prev_token, int token) {
   if (token < 0 || token >= t->vocab_size)
     return "";
   char *piece = t->vocab[token];
-  if (prev_token == 1 && piece[0] == ' ')
-    piece++; // strip leading space after BOS
   unsigned char byte_val;
   if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
     return (char *)(t->byte_pieces + byte_val * 2);
@@ -985,11 +983,19 @@ int main(int argc, char **argv) {
   Tokenizer tokenizer;
   read_tokenizer(&tokenizer, tokpath, model.config.vocab_size);
 
-  // Encode prompt
-  const int BOS = 1, EOS = 2; // tokenizer.bin convention
+  // Try to discover special tokens in the vocab (o200k)
+  int BOS = find_token_id(&tokenizer, "<|begin_of_text|>");
+  if (BOS < 0)
+    BOS = find_token_id(&tokenizer, "<|beginoftext|>");
+  int EOS = find_token_id(&tokenizer, "<|end_of_text|>");
+  if (EOS < 0)
+    EOS = find_token_id(&tokenizer, "<|endoftext|>");
+
+  // Encode prompt (only add BOS if we actually found it; don't auto-append EOS)
   int *tokens = (int *)malloc(sizeof(int) * (model.config.seq_len));
   int ntok = 0;
-  encode(&tokenizer, prompt, BOS, -1, tokens, &ntok, model.config.seq_len);
+  encode(&tokenizer, prompt, (BOS >= 0 ? BOS : -1), -1, tokens, &ntok,
+         model.config.seq_len);
   if (ntok < 1) {
     fprintf(stderr, "empty prompt after encoding\n");
     return 1;
@@ -1016,8 +1022,8 @@ int main(int argc, char **argv) {
       next = sample_next(&sampler, logits);
     }
 
-    // terminate on BOS when generating (matches llama2.c behavior)
-    if (next == BOS)
+    // terminate on EOS if we actually have it
+    if (EOS >= 0 && next == EOS)
       break;
 
     // print decoded piece based on transition (prev token -> next token)
