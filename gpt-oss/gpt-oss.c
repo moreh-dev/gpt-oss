@@ -347,22 +347,25 @@ static char *decode_piece(Tokenizer *t, int prev_token, int token) {
   if (token < 0 || token >= t->vocab_size)
     return "";
   char *piece = t->vocab[token];
+  // If the token is a byte token, return the byte, else return the string
+  // as-is.
   unsigned char byte_val;
   if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
-    return (char *)(t->byte_pieces + byte_val * 2);
+    // Return the actual byte as a string (not just printable/space)
+    static char buf[2];
+    buf[0] = (char)byte_val;
+    buf[1] = '\0';
+    return buf;
   }
+  // If the piece is a valid UTF-8 multi-byte string, return as-is
   return piece;
 }
 
 static void safe_printf(const char *s) {
   if (!s || !*s)
     return;
-  if (!s[1]) { // possible single raw byte
-    unsigned char b = (unsigned char)s[0];
-    if (!(isprint(b) || isspace(b)))
-      return;
-  }
-  printf("%s", s);
+  // Print all bytes, including non-printable, to support full UTF-8/emoji
+  fputs(s, stdout);
 }
 
 // -------------------------------
