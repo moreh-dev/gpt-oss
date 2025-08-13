@@ -314,120 +314,182 @@ static void free_tokenizer(Tokenizer *t) {
   free(t->sorted_vocab);
 }
 
-// Greedy BPE with minimal allocations.
-// - Start from raw bytes -> byte tokens
-// - Repeatedly merge adjacent pairs if the concatenation exists
-//   and is not "special" (score <= -1e29 treated as special marker).
-static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
-                   int *out, int *n_out, int max_tokens) {
-  const unsigned char *p = (const unsigned char *)text;
-  int text_len = (int)strlen((const char *)p);
+// ======== C99: raw-bytes BPE helpers (no lambdas) ========
 
-  // Worst-case capacity (bytes + BOS + EOS)
-  int cap = text_len + 2;
-  int *tokens = (int *)malloc(sizeof(int) * (size_t)cap);
-  if (!tokens) {
-    fprintf(stderr, "encode OOM\n");
-    exit(1);
-  }
+static inline int find_token_bytes(Tokenizer *t, const unsigned char *p,
+                                   int len) {
+  TokenIndex key = {.str = (const char *)p, .len = len, .id = -1};
+  TokenIndex *res = (TokenIndex *)bsearch(&key, t->sorted_vocab, t->vocab_size,
+                                          sizeof(TokenIndex), compare_tokens);
+  return res ? res->id : -1;
+}
 
-  int ntok = 0;
-  if (bos_id >= 0)
-    tokens[ntok++] = bos_id;
+// Return a "rank" (token id) for merge of parts[i]..parts[i+2].
+// If merge not possible, returns a large sentinel (RANK_MAX).
+static inline unsigned get_merge_rank(Tokenizer *t, const unsigned char *piece,
+                                      int piece_len, const int *parts,
+                                      int n_parts, int i) {
+  const unsigned RANK_MAX = 0xFFFFFFFFu;
+  if (i + 2 >= n_parts)
+    return RANK_MAX;
 
-  // 1) Bytes -> initial tokens
-  for (int i = 0; i < text_len; i++) {
-    int id = t->byte_tokens[p[i]];
-    if (id < 0) {
-      // Should not happen for a sane tokenizer; fallback to first vocab id
-      // (usually <unk>)
+  int start = parts[i];
+  int end = parts[i + 2];
+  int span = end - start;
+
+  if (span <= 0 || span > t->max_token_length || end > piece_len)
+    return RANK_MAX;
+
+  int id = find_token_bytes(t, piece + start, span);
+  if (id < 0)
+    return RANK_MAX;
+
+  // Don’t merge into specials (exporter gives them very negative scores)
+  if (t->scores[id] <= -1e29f)
+    return RANK_MAX;
+
+  return (unsigned)id; // token id acts as merge rank, like tiktoken
+}
+
+static int encode_piece_bytes_bpe(Tokenizer *t, const unsigned char *piece,
+                                  int piece_len, int *out, int out_cap) {
+  if (piece_len <= 0)
+    return 0;
+
+  if (piece_len == 1) {
+    int id = find_token_bytes(t, piece, 1);
+    if (id < 0)
       id = 0;
-    }
-    tokens[ntok++] = id;
+    if (out_cap > 0)
+      out[0] = id;
+    return 1;
   }
 
-  // Scratch for candidate concatenations, allocated once up to max_token_length
-  char *cat = (char *)malloc((size_t)t->max_token_length + 1);
-  if (!cat) {
-    fprintf(stderr, "encode OOM (cat)\n");
+  // parts[k] = start offsets into piece; add a sentinel == piece_len
+  int parts_cap = piece_len + 2;
+  int *parts = (int *)malloc((size_t)parts_cap * sizeof(int));
+  if (!parts) {
+    fprintf(stderr, "OOM parts\n");
     exit(1);
   }
 
-  // 2) Greedy merges: lowest score (rank) wins, skip specials
-  // We'll maintain a parallel array of (piece ptr, len) to avoid strlen.
-  const char **pieces = (const char **)malloc(sizeof(char *) * (size_t)ntok);
-  int *plens = (int *)malloc(sizeof(int) * (size_t)ntok);
-  if (!pieces || !plens) {
-    fprintf(stderr, "encode OOM (pieces)\n");
-    exit(1);
-  }
-  for (int i = 0; i < ntok; i++) {
-    pieces[i] = t->vocab[tokens[i]];
-    plens[i] = t->lengths[tokens[i]];
-  }
+  int n_parts = 0;
+  for (int i = 0; i < piece_len; i++)
+    parts[n_parts++] = i;
+  parts[n_parts++] = piece_len; // sentinel
 
+  // Repeatedly merge the adjacent pair with smallest rank
   while (1) {
-    float best_score = 1e29f;
-    int best_idx = -1, best_id = -1;
+    const unsigned RANK_MAX = 0xFFFFFFFFu;
+    unsigned best_rank = RANK_MAX;
+    int best_i = -1;
 
-    for (int i = 0; i < ntok - 1; i++) {
-      int la = plens[i], lb = plens[i + 1];
-      int lsum = la + lb;
-      if (lsum > t->max_token_length)
-        continue;
-
-      // Build concatenation in scratch
-      memcpy(cat, pieces[i], (size_t)la);
-      memcpy(cat + la, pieces[i + 1], (size_t)lb);
-      cat[lsum] = '\0';
-
-      int id = find_token_id(t, cat, lsum);
-      if (id < 0)
-        continue;
-
-      float score = t->scores[id];
-      // Treat very negative scores as "special" => non-mergeable
-      if (score <= -1e29f)
-        continue;
-
-      // Lower score = earlier merge (rank). Choose the minimum.
-      if (score < best_score) {
-        best_score = score;
-        best_idx = i;
-        best_id = id;
+    for (int i = 0; i + 2 < n_parts; i++) {
+      unsigned r = get_merge_rank(t, piece, piece_len, parts, n_parts, i);
+      if (r < best_rank) {
+        best_rank = r;
+        best_i = i;
       }
     }
+    if (best_i < 0)
+      break; // no more merges
 
-    if (best_idx < 0)
-      break;
-
-    // Commit the best merge: replace pair (best_idx, best_idx+1) with best_id
-    tokens[best_idx] = best_id;
-    pieces[best_idx] = t->vocab[best_id];
-    plens[best_idx] = t->lengths[best_id];
-    for (int j = best_idx + 1; j < ntok - 1; j++) {
-      tokens[j] = tokens[j + 1];
-      pieces[j] = pieces[j + 1];
-      plens[j] = plens[j + 1];
-    }
-    ntok--;
+    // Merge at best_i: delete parts[best_i + 1]
+    for (int j = best_i + 1; j + 1 < n_parts; j++)
+      parts[j] = parts[j + 1];
+    n_parts--;
   }
 
-  // 3) Append EOS if requested and space remains
-  if (eos_id >= 0 && ntok < cap)
-    tokens[ntok++] = eos_id;
+  // Emit final tokens for spans parts[i]..parts[i+1]
+  int n_out = 0;
+  for (int i = 0; i + 1 < n_parts; i++) {
+    int start = parts[i];
+    int end = parts[i + 1];
+    int span = end - start;
+    if (span <= 0)
+      continue;
+    int id = find_token_bytes(t, piece + start, span);
+    if (id < 0)
+      id = 0; // should not happen
+    if (n_out < out_cap)
+      out[n_out] = id;
+    n_out++;
+  }
 
-  // 4) Truncate if caller's buffer is smaller
-  if (ntok > max_tokens)
-    ntok = max_tokens;
-  for (int i = 0; i < ntok; i++)
-    out[i] = tokens[i];
+  free(parts);
+  return n_out;
+}
+
+// ======== REPLACE your old encode() with this ========
+
+// Split `text` into pieces like tiktoken.encode_ordinary for digit runs only:
+// - Any consecutive ASCII digits [0-9] are split into chunks of 3,3,3,... and a
+// final 1-2.
+// - All non-digit runs are passed through as-is (one piece).
+// For your numeric test prompts, this reproduces tiktoken's pre-splitting.
+static int encode_with_simple_splits(Tokenizer *t, const unsigned char *bytes,
+                                     int len, int *out, int out_cap) {
+  int n_out = 0;
+  int i = 0;
+
+  while (i < len) {
+    if (bytes[i] >= '0' && bytes[i] <= '9') {
+      // collect full digit run
+      int j = i + 1;
+      while (j < len && bytes[j] >= '0' && bytes[j] <= '9')
+        j++;
+
+      // split into 3-3-...-remainder
+      int run_len = j - i;
+      int k = i;
+      while (run_len > 0) {
+        int chunk = run_len >= 3 ? 3 : run_len;
+        if (n_out < out_cap)
+          n_out += encode_piece_bytes_bpe(t, bytes + k, chunk, out + n_out,
+                                          out_cap - n_out);
+        else
+          n_out += encode_piece_bytes_bpe(t, bytes + k, chunk, NULL, 0);
+        k += chunk;
+        run_len -= chunk;
+      }
+      i = j;
+    } else {
+      // collect a non-digit run and send it as one piece
+      int j = i + 1;
+      while (j < len && !(bytes[j] >= '0' && bytes[j] <= '9'))
+        j++;
+
+      int span = j - i;
+      if (n_out < out_cap)
+        n_out += encode_piece_bytes_bpe(t, bytes + i, span, out + n_out,
+                                        out_cap - n_out);
+      else
+        n_out += encode_piece_bytes_bpe(t, bytes + i, span, NULL, 0);
+      i = j;
+    }
+  }
+  return n_out;
+}
+
+static void encode(Tokenizer *t, const char *text, int bos_id, int eos_id,
+                   int *out, int *n_out, int max_tokens) {
+  const unsigned char *bytes = (const unsigned char *)text;
+  const int len = (int)strlen((const char *)bytes);
+
+  int ntok = 0;
+  if (bos_id >= 0 && ntok < max_tokens)
+    out[ntok++] = bos_id;
+
+  if (ntok < max_tokens) {
+    ntok +=
+        encode_with_simple_splits(t, bytes, len, out + ntok, max_tokens - ntok);
+    if (ntok > max_tokens)
+      ntok = max_tokens;
+  }
+
+  if (eos_id >= 0 && ntok < max_tokens)
+    out[ntok++] = eos_id;
   *n_out = ntok;
-
-  free(tokens);
-  free(pieces);
-  free(plens);
-  free(cat);
 }
 
 static char *decode_piece(Tokenizer *t, int prev_token, int token) {
