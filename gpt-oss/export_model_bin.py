@@ -197,6 +197,8 @@ def infer_heads_from_fused_qkv(T, i, dim):
         raise ValueError(
             f"layer {i}: unexpected fused qkv rows={rows}, dim={dim}")
     kv_dim_fused = (rows - dim) // 2
+    if dim + 2*kv_dim_fused != rows:
+        raise ValueError(f"layer {i}: fused rows don't split as dim + 2*kv ({rows} vs {dim}+2*{kv_dim_fused})")
     hd = gcd(dim, kv_dim_fused)
     if hd <= 0 or (dim % hd) or (kv_dim_fused % hd):
         raise ValueError(
@@ -584,11 +586,25 @@ def main():
     # ---- header (matches gpt-oss.c) ----
     # int dim, hidden_dim, n_layers, n_heads, n_kv_heads, n_experts, top_k,
     #     vocab_size, seq_len, window, alt_banded; float rope_base, rope_scale
-    vocab_field = vsz  # positive => separate lm_head at end
+
+    # Decide if we have a separate lm_head before writing header
+    lm = fetch(T,
+               "lm_head.weight",
+               "model.lm_head.weight",
+               "output.weight",
+               "transformer.lm_head.weight",
+               required=False,
+               expect_shape=(vsz, dim),
+               hints=("lm_head", "out", "cls"))
+    if lm is None:
+        vocab_field = -vsz  # negative => tied embeddings
+    else:
+        vocab_field = vsz   # positive => separate lm_head at end
     hdr = struct.pack("<11i2f", dim, hidden, nL, nH, nKV, nExp, topk,
                       vocab_field, seql, win, alt, ropeB, ropeS)
 
     print(f"[INFO] Writing binary to {outp}")
+
     with open(outp, "wb") as f:
         f.write(hdr)
 
@@ -691,25 +707,10 @@ def main():
                      hints=("norm", "ln_f", "scale"))
         write_mat(f, norm)
 
-        print("[INFO] Writing lm_head or tied embeddings...")
-        lm = fetch(T,
-                   "lm_head.weight",
-                   "model.lm_head.weight",
-                   "output.weight",
-                   "transformer.lm_head.weight",
-                   required=False,
-                   expect_shape=(vsz, dim),
-                   hints=("lm_head", "out", "cls"))
+        print("[INFO] Writing lm_head or marking as tied...")
         if lm is None:
-            print(
-                "[INFO] No separate lm_head found — exporting with TIED embeddings"
-            )
-            f.seek(0)
-            raw = f.read(struct.calcsize("<11i2f"))
-            vals = list(struct.unpack("<11i2f", raw))
-            vals[7] = -vsz  # negative vocab => tied in C
-            f.seek(0)
-            f.write(struct.pack("<11i2f", *vals))
+            print("[INFO] No separate lm_head found — exporting with TIED embeddings")
+            # Nothing to write: header already marks tied
         else:
             write_mat(f, lm)
 

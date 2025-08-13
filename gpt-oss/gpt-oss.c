@@ -378,6 +378,8 @@ static inline void apply_rope_yarn(float *vec, int size, int head_size, int pos,
                                    float rope_base, float s, int L_new) {
   if (s <= 0.0f)
     s = 1.0f;
+  if (s > 1024.0f)
+    s = 1024.0f; // sanity clamp for extreme configs
   for (int i = 0; i < size; i += 2) {
     int j = (i % head_size) >> 1;
     float inv_freq = powf(rope_base, -(2.0f * (float)j) / (float)head_size);
@@ -454,6 +456,10 @@ static float *forward(GPTOSSModel *model, int token, int pos) {
       if (w->attn_sink)
         sink = w->attn_sink[(size_t)l * p->n_heads + h];
 
+      // clear attention scratch for active window before use
+      for (int t = t_start; t <= pos; t++) {
+        att[t] = 0.0f;
+      }
       // compute scores against cached keys in window [t_start..pos]
       for (int t = t_start; t <= pos; t++) {
         const float *krow =
