@@ -1097,8 +1097,7 @@ int main(int argc, char **argv) {
   // Encode prompt (only add BOS if we actually found it; don't auto-append EOS)
   int *tokens = (int *)malloc(sizeof(int) * (model.config.seq_len));
   int ntok = 0;
-  encode(&tokenizer, prompt, (BOS >= 0 ? BOS : -1), -1, tokens, &ntok,
-         model.config.seq_len);
+  encode(&tokenizer, prompt, BOS, -1, tokens, &ntok, model.config.seq_len);
   if (ntok < 1) {
     fprintf(stderr, "empty prompt after encoding\n");
     return 1;
