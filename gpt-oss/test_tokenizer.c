@@ -26,8 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define TESTING 1
-#include "gpt-oss.c" // brings Tokenizer, read_tokenizer, encode, decode_piece, free_tokenizer, safe_printf
+#include "tokenizer.h"
 
 // ---------- Exit codes ----------
 enum {
