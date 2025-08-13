@@ -1,6 +1,5 @@
-// gpt_oss_core.c
-// Core loader, verifier, and forward pass for GPT-OSS.
-// This file is self-contained; another file can #include it or link to it.
+// gpt_oss_core.c — core loader + verifier + forward
+// included by gpt_oss_main.c
 
 #include <errno.h>
 #include <fcntl.h>
@@ -14,87 +13,95 @@
 #include <unistd.h>
 
 #pragma pack(push, 1)
+// header written by exporter (11 ints + 2 floats = 52 bytes)
 typedef struct {
-  int dim;
-  int hidden_dim;
+  int dim;        // residual width
+  int hidden_dim; // FFN hidden (per expert or dense)
   int n_layers;
-  int n_heads;
-  int n_kv_heads;
-  int n_experts;
-  int top_k;
-  int vocab_size; // NEGATIVE => tied output head
+  int n_heads;    // stored "sink heads" used for attn_sinks (not necessarily
+                  // dim/head_dim)
+  int n_kv_heads; // KV heads (GQA)
+  int n_experts;  // 0 => dense
+  int top_k;      // router top-k (unused if n_experts==0)
+  int vocab_size; // NEGATIVE => tied LM head
   int seq_len;
   int window;
-  int alt_banded; // 0=dense, +1=even banded, -1=odd banded, +2=all banded
+  int alt_banded; // 0 dense, ±1 alternate, 2 all banded
   float rope_base;
   float rope_scale;
 } GPTOSSConfig;
 #pragma pack(pop)
+_Static_assert(sizeof(GPTOSSConfig) == 52, "header must be 52 bytes");
 
-_Static_assert(sizeof(GPTOSSConfig) == 52,
-               "GPTOSSConfig must be 52 bytes (<11i2f>)");
-
+// ---------- UPDATED: weights, add MoE pointers ----------
 typedef struct {
   float *tok_embeddings; // [vocab, dim]
   float *rms_att_w;      // [L, dim]
   float *rms_ffn_w;      // [L, dim]
-  float *wq;             // [L, dim, dim]
+  float *wq;             // [L, q_dim, dim]
   float *wk;             // [L, kv_dim, dim]
   float *wv;             // [L, kv_dim, dim]
-  float *wo;             // [L, dim, dim]
-  float *bq;             // [L, dim]
+  float *wo;             // [L, dim, q_dim]
+  float *bq;             // [L, q_dim]
   float *bk;             // [L, kv_dim]
   float *bv;             // [L, kv_dim]
   float *bo;             // [L, dim]
-  float *attn_sink;      // [L, n_heads]
-  // MoE
-  float *wr;     // [L, E, dim]
-  float *br;     // [L, E]
-  float *w_up;   // [L, E, hidden, dim]
-  float *w_gate; // [L, E, hidden, dim]
-  float *w_down; // [L, E, dim, hidden]
-  float *b_up;   // [L, E, hidden]
-  float *b_gate; // [L, E, hidden]
-  float *b_down; // [L, E, dim]
-  // final
+  float *attn_sink;      // [L, sink_heads]
+  // MoE (optional)
+  float *wr;    // [L, E, dim]
+  float *br;    // [L, E]
+  float *wup;   // [L, E, hidden, dim]
+  float *wgate; // [L, E, hidden, dim]
+  float *wdown; // [L, E, dim, hidden]
+  float *bup;   // [L, E, hidden]
+  float *bgate; // [L, E, hidden]
+  float *bdown; // [L, E, dim]
+
   float *rms_final_w; // [dim]
-  float *wcls;        // [vocab, dim] or tied to tok_embeddings
+  float *wcls;        // [vocab, dim] (or tied)
 } GPTOSSWeights;
 
 typedef struct {
-  float *x, *xb, *xb2;          // [dim]
-  float *q;                     // [dim]
-  float *k, *v;                 // [kv_dim]
-  float *hb, *hb2;              // [hidden]
-  float *att;                   // [n_heads * seq_len]
-  float *logits;                // [vocab]
-  float *key_cache, *val_cache; // [L, T, kv_dim]
-  float *router;                // [E]
-  int *topk_idx;                // [K]
-  float *topk_weight;           // [K]
+  // derived at load time
+  int head_dim;   // per-head width
+  int kv_dim;     // n_kv_heads * head_dim
+  int q_dim;      // q_heads * head_dim
+  int q_heads;    // q_dim / head_dim
+  int sink_heads; // header.n_heads
+
+  // activations/scratch
+  float *x, *xb, *xb2;
+  float *q, *k, *v, *xq;
+  float *hb, *hb2; // (unused if dense FFN)
+  float *att, *logits;
+  float *key_cache, *val_cache;
+  float *router;
+  int *topk_idx;
+  float *topk_weight; // (unused if dense FFN)
 } RunState;
 
 typedef struct {
   GPTOSSConfig cfg;
   GPTOSSWeights w;
   RunState s;
+
+  // mmap bookkeeping
   int fd;
   void *mapped;
   size_t file_size;
+
+  int tied; // 1 if header.vocab_size was negative (tied output head)
 } GPTOSSModel;
 
-// ------------------------------ math helpers
-
-static inline void rmsnorm(float *restrict o, const float *restrict x,
-                           const float *restrict w, int size) {
+// ---------- tiny math ----------
+static inline void rmsnorm(float *o, const float *x, const float *w, int n) {
   float ss = 0.0f;
-  for (int j = 0; j < size; j++)
-    ss += x[j] * x[j];
-  float inv = 1.0f / sqrtf(ss / (float)size + 1e-5f);
-  for (int j = 0; j < size; j++)
-    o[j] = w[j] * (inv * x[j]);
+  for (int i = 0; i < n; i++)
+    ss += x[i] * x[i];
+  float inv = 1.0f / sqrtf(ss / (float)n + 1e-5f);
+  for (int i = 0; i < n; i++)
+    o[i] = w[i] * (inv * x[i]);
 }
-
 static inline void softmax_inplace(float *x, int n) {
   float mx = x[0];
   for (int i = 1; i < n; i++)
@@ -109,19 +116,17 @@ static inline void softmax_inplace(float *x, int n) {
   for (int i = 0; i < n; i++)
     x[i] *= inv;
 }
-
-// y[d] = W[d,n] @ x[n], W row-major (out, in)
-static inline void matmul(float *restrict y, const float *restrict x,
-                          const float *restrict w, int n, int d) {
+static inline void matmul(float *y, const float *x, const float *w, int n,
+                          int d) {
+  // y(d) = W(d,n) @ x(n) ; W row-major by d
   for (int i = 0; i < d; i++) {
     const float *wi = w + (size_t)i * n;
-    float sum = 0.0f;
+    float s = 0.0f;
     for (int j = 0; j < n; j++)
-      sum += wi[j] * x[j];
-    y[i] = sum;
+      s += wi[j] * x[j];
+    y[i] = s;
   }
 }
-
 static inline void topk_indices(const float *x, int n, int k, int *idx,
                                 float *val) {
   for (int i = 0; i < k; i++) {
@@ -131,13 +136,14 @@ static inline void topk_indices(const float *x, int n, int k, int *idx,
   for (int i = 0; i < n; i++) {
     float v = x[i];
     int pos = -1;
-    for (int j = 0; j < k; j++)
+    for (int j = 0; j < k; j++) {
       if (v > val[j]) {
         pos = j;
         break;
       }
+    }
     if (pos >= 0) {
-      for (int j = k - 1; j > pos; j--) {
+      for (int j = k - 1; j > pos; j++) {
         val[j] = val[j - 1];
         idx[j] = idx[j - 1];
       }
@@ -147,43 +153,114 @@ static inline void topk_indices(const float *x, int n, int k, int *idx,
   }
 }
 
-// ------------------------------ allocation
+static int solve_dims_moe_aware(const GPTOSSConfig *p, size_t floats_after_hdr,
+                                int tied, int *out_head_dim, int *out_kv_dim,
+                                int *out_q_dim, int *out_q_heads,
+                                int *out_sink_heads, int *out_experts) {
+  const size_t L = (size_t)p->n_layers, D = (size_t)p->dim,
+               V = (size_t)p->vocab_size;
+  const int hidden = p->hidden_dim;
 
+  // fixed parts that do NOT depend on q_dim/q_heads or MoE
+  size_t prefix = V * D + L * D * 2; // embeddings + two RMS
+  // KV-dependent but not q-dependent
+  // we'll fill kv_dim from head_dim * n_kv_heads per candidate
+  // tail pieces independent of q and MoE:
+  size_t tail_fixed_base =
+      L * (size_t)D /*BO*/ + D /*final RMS*/ + (tied ? 0 : V * D);
+
+  // try common head_dims
+  const int cand[] = {64, 80, 96, 128, 48, 40, 32};
+  const int NC = (int)(sizeof(cand) / sizeof(cand[0]));
+
+  for (int ci = 0; ci < NC; ++ci) {
+    int hd = cand[ci];
+    int kv_dim = hd * p->n_kv_heads;
+
+    size_t kv_block =
+        L * ((size_t)2 * kv_dim * D + (size_t)2 * kv_dim); // WK+WV + BK+BV
+
+    if (floats_after_hdr < prefix + kv_block + tail_fixed_base)
+      continue;
+
+    // Remainder = [q parts + sinks + optional MoE]
+    size_t R = floats_after_hdr - prefix - kv_block - tail_fixed_base;
+
+    // write q_dim = hd * QH ; sinks use QH as well
+    // q-dependent contribution: L*QH*((2*D+1)*hd + 1)
+    const size_t a = (size_t)((2 * D + 1) * hd + 1);
+
+    // MoE contribution per expert: L*(3*hidden*D + 2*D + 2*hidden + 1)
+    const size_t b =
+        (size_t)(3 * (size_t)hidden * D + 2 * D + 2 * (size_t)hidden + 1);
+
+    if (R % L)
+      continue; // must be multiple of L
+    size_t R1 = R / L;
+
+    // Scan plausible QH (query heads). Realistic range keeps it tiny.
+    for (int QH = 1; QH <= 256; ++QH) {
+      size_t q_term = (size_t)a * (size_t)QH;
+      if (R1 < q_term)
+        break; // too big already
+      size_t rem = R1 - q_term;
+
+      if (rem == 0) {
+        // no MoE case
+        *out_head_dim = hd;
+        *out_kv_dim = kv_dim;
+        *out_q_heads = QH;
+        *out_q_dim = hd * QH;
+        *out_sink_heads = QH;
+        *out_experts = 0;
+        return 1;
+      }
+      if (b > 0 && rem % b == 0) {
+        int E = (int)(rem / b);
+        if (E > 0) {
+          *out_head_dim = hd;
+          *out_kv_dim = kv_dim;
+          *out_q_heads = QH;
+          *out_q_dim = hd * QH;
+          *out_sink_heads = QH; // sinks sized by query heads
+          *out_experts = E;
+          return 1;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+// ---------- state alloc ----------
 static void malloc_run_state(RunState *s, const GPTOSSConfig *p) {
-  const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-
-  s->x = (float *)calloc(p->dim, sizeof(float));
-  s->xb = (float *)calloc(p->dim, sizeof(float));
-  s->xb2 = (float *)calloc(p->dim, sizeof(float));
-
-  s->q = (float *)calloc(p->dim, sizeof(float));
+  const int dim = p->dim, q_dim = s->q_dim, kv_dim = s->kv_dim;
+  s->x = (float *)calloc(dim, sizeof(float));
+  s->xb = (float *)calloc(dim, sizeof(float));
+  s->xb2 = (float *)calloc(dim, sizeof(float));
+  s->q = (float *)calloc(q_dim, sizeof(float));
   s->k = (float *)calloc(kv_dim, sizeof(float));
   s->v = (float *)calloc(kv_dim, sizeof(float));
-
+  s->xq = (float *)calloc(q_dim, sizeof(float));
   s->hb = (float *)calloc(p->hidden_dim, sizeof(float));
   s->hb2 = (float *)calloc(p->hidden_dim, sizeof(float));
-
-  s->att = (float *)calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
+  s->att = (float *)calloc((size_t)s->q_heads * p->seq_len, sizeof(float));
   s->logits = (float *)calloc(p->vocab_size, sizeof(float));
-
   s->key_cache =
       (float *)calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
   s->val_cache =
       (float *)calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
-
   s->router =
       (float *)calloc(p->n_experts > 0 ? p->n_experts : 1, sizeof(float));
   s->topk_idx = (int *)calloc(p->top_k > 0 ? p->top_k : 1, sizeof(int));
   s->topk_weight = (float *)calloc(p->top_k > 0 ? p->top_k : 1, sizeof(float));
-
-  if (!s->x || !s->xb || !s->xb2 || !s->q || !s->k || !s->v || !s->hb ||
-      !s->hb2 || !s->att || !s->logits || !s->key_cache || !s->val_cache ||
-      !s->router || !s->topk_idx || !s->topk_weight) {
+  if (!s->x || !s->xb || !s->xb2 || !s->q || !s->k || !s->v || !s->xq ||
+      !s->hb || !s->hb2 || !s->att || !s->logits || !s->key_cache ||
+      !s->val_cache || !s->router || !s->topk_idx || !s->topk_weight) {
     fprintf(stderr, "malloc failed\n");
     exit(1);
   }
 }
-
 static void free_run_state(RunState *s) {
   free(s->x);
   free(s->xb);
@@ -191,6 +268,7 @@ static void free_run_state(RunState *s) {
   free(s->q);
   free(s->k);
   free(s->v);
+  free(s->xq);
   free(s->hb);
   free(s->hb2);
   free(s->att);
@@ -202,300 +280,243 @@ static void free_run_state(RunState *s) {
   free(s->topk_weight);
 }
 
-// ------------------------------ mapping
-
-static void memory_map_weights(GPTOSSWeights *w, const GPTOSSConfig *p,
-                               float *ptr, int shared_weights) {
-  const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  const size_t L = (size_t)p->n_layers;
-  const size_t E = (size_t)(p->n_experts > 0 ? p->n_experts : 1);
-
-  w->tok_embeddings = ptr;
-  ptr += (size_t)p->vocab_size * p->dim;
-
-  w->rms_att_w = ptr;
-  ptr += L * p->dim;
-  w->rms_ffn_w = ptr;
-  ptr += L * p->dim;
-
-  w->wq = ptr;
-  ptr += L * (size_t)p->dim * p->dim;
-  w->wk = ptr;
-  ptr += L * (size_t)kv_dim * p->dim;
-  w->wv = ptr;
-  ptr += L * (size_t)kv_dim * p->dim;
-  w->wo = ptr;
-  ptr += L * (size_t)p->dim * p->dim;
-
-  w->bq = ptr;
-  ptr += L * p->dim;
-  w->bk = ptr;
-  ptr += L * kv_dim;
-  w->bv = ptr;
-  ptr += L * kv_dim;
-  w->bo = ptr;
-  ptr += L * p->dim;
-
-  w->attn_sink = ptr;
-  ptr += L * p->n_heads;
-
-  if (p->n_experts > 0) {
-    w->wr = ptr;
-    ptr += L * E * p->dim;
-    w->br = ptr;
-    ptr += L * E;
-
-    w->w_up = ptr;
-    ptr += L * E * (size_t)p->hidden_dim * p->dim;
-    w->w_gate = ptr;
-    ptr += L * E * (size_t)p->hidden_dim * p->dim;
-    w->w_down = ptr;
-    ptr += L * E * (size_t)p->dim * p->hidden_dim;
-
-    w->b_up = ptr;
-    ptr += L * E * p->hidden_dim;
-    w->b_gate = ptr;
-    ptr += L * E * p->hidden_dim;
-    w->b_down = ptr;
-    ptr += L * E * p->dim;
-  } else {
-    w->wr = w->br = NULL;
-    w->w_up = w->w_gate = w->w_down = NULL;
-    w->b_up = w->b_gate = w->b_down = NULL;
-  }
-
-  w->rms_final_w = ptr;
-  ptr += p->dim;
-  w->wcls = shared_weights ? w->tok_embeddings : ptr;
-}
-
-// compute expected floats *excluding* lm_head if tied
-static size_t expected_floats_min(const GPTOSSConfig *p) {
-  const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  const size_t L = (size_t)p->n_layers;
-  const size_t E = (size_t)(p->n_experts > 0 ? p->n_experts : 1);
-  size_t tot = 0;
-  tot += (size_t)p->vocab_size * p->dim;
-  tot += L * p->dim * 2;                  // rms
-  tot += L * (size_t)p->dim * p->dim * 2; // WQ + WO
-  tot += L * (size_t)kv_dim * p->dim * 2; // WK + WV
-  tot += L * (size_t)p->dim * 2;          // BQ + BO
-  tot += L * (size_t)kv_dim * 2;          // BK + BV
-  tot += L * p->n_heads;                  // sink
-  if (p->n_experts > 0) {
-    tot += L * E * p->dim;                             // WR
-    tot += L * E;                                      // BR
-    tot += L * E * (size_t)p->hidden_dim * p->dim * 2; // WUP/WGATE
-    tot += L * E * (size_t)p->dim * p->hidden_dim;     // WDOWN
-    tot += L * E * (size_t)p->hidden_dim * 2;          // BUP/BGATE
-    tot += L * E * p->dim;                             // BDOWN
-  }
-  tot += p->dim; // rms_final
-  return tot;
-}
-
-static int in_range(void *base, size_t total_bytes, const float *ptr,
-                    size_t count_floats) {
-  const uint8_t *b = (const uint8_t *)base;
-  const uint8_t *p = (const uint8_t *)ptr;
-  const uint8_t *e = p + count_floats * sizeof(float);
-  return (p >= b) && (e <= (b + total_bytes)) && (p <= e);
-}
-
-static void section_stats(const char *name, const float *p, size_t n,
-                          float *out_min, float *out_max, double *out_mean,
-                          int *nan_count) {
-  float mn = +INFINITY, mx = -INFINITY;
-  double acc = 0.0;
-  int nans = 0;
-  for (size_t i = 0; i < n; i++) {
-    float v = p[i];
-    if (isnan(v)) {
-      nans++;
-      continue;
-    }
-    if (v < mn)
-      mn = v;
-    if (v > mx)
-      mx = v;
-    acc += (double)v;
-  }
-  if (out_min)
-    *out_min = (nans == (int)n ? 0.0f : mn);
-  if (out_max)
-    *out_max = (nans == (int)n ? 0.0f : mx);
-  if (out_mean)
-    *out_mean = (nans == (int)n ? 0.0 : acc / (double)(n - nans));
-  if (nan_count)
-    *nan_count = nans;
-  fprintf(stderr, "[VERIFY] %-12s  n=%zu  min=%g  max=%g  mean=%g  NaN=%d\n",
-          name, n, (double)mn, (double)mx, (n ? acc / (double)(n - nans) : 0.0),
-          nans);
-}
-
-static void verify_or_die(GPTOSSModel *m, int verbose) {
-  GPTOSSConfig *p = &m->cfg;
-  if (p->dim <= 0 || p->n_heads <= 0) {
-    fprintf(stderr, "[ERR] bad dim/heads\n");
-    exit(1);
-  }
-  if (p->dim % p->n_heads) {
-    fprintf(stderr, "[ERR] dim %% n_heads != 0\n");
-    exit(1);
-  }
-  if (p->n_kv_heads <= 0 || p->n_kv_heads > p->n_heads) {
-    fprintf(stderr, "[ERR] bad n_kv_heads\n");
-    exit(1);
-  }
-  int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  if (kv_dim * p->n_heads != p->dim * p->n_kv_heads) {
-    fprintf(stderr, "[ERR] kv_dim mismatch\n");
-    exit(1);
-  }
-  if (p->seq_len <= 0) {
-    fprintf(stderr, "[ERR] seq_len <= 0\n");
-    exit(1);
-  }
-  if (p->window < 0 || p->window > p->seq_len) {
-    fprintf(stderr, "[ERR] bad window\n");
-    exit(1);
-  }
-
-  size_t min_floats = expected_floats_min(p);
-  size_t min_bytes = sizeof(GPTOSSConfig) + 4 * min_floats;
-  if (m->file_size < min_bytes) {
-    fprintf(stderr, "[ERR] file too small: %zu < %zu\n", m->file_size,
-            min_bytes);
-    exit(1);
-  }
-  // If LM head is untied, exact size should equal min_bytes + 4*vocab*dim
-  size_t exact_with_head =
-      min_bytes + 4ull * (size_t)p->vocab_size * (size_t)p->dim;
-  if (m->file_size != min_bytes && m->file_size != exact_with_head) {
-    fprintf(stderr, "[WARN] unexpected file size: %zu (expected %zu or %zu)\n",
-            m->file_size, min_bytes, exact_with_head);
-  }
-
-// Range checks and quick stats for each section
-#define CHK(ptr, count, name)                                                  \
-  do {                                                                         \
-    if (!(in_range(m->mapped, m->file_size, (ptr), (count)))) {                \
-      fprintf(stderr, "[ERR] section %s out of range\n", (name));              \
-      exit(1);                                                                 \
-    }                                                                          \
-    if (verbose) {                                                             \
-      float mn, mx;                                                            \
-      double mean;                                                             \
-      int nans;                                                                \
-      section_stats((name), (ptr), (count), &mn, &mx, &mean, &nans);           \
-      if (isnan(mn) || isnan(mx) || nans)                                      \
-        fprintf(stderr, "[WARN] NaNs in %s\n", (name));                        \
-    }                                                                          \
-  } while (0)
-
-  const size_t L = (size_t)p->n_layers;
-  const size_t E = (size_t)(p->n_experts > 0 ? p->n_experts : 1);
-
-  CHK(m->w.tok_embeddings, (size_t)p->vocab_size * p->dim, "tok_embeddings");
-
-  CHK(m->w.rms_att_w, L * p->dim, "rms_att_w");
-  CHK(m->w.rms_ffn_w, L * p->dim, "rms_ffn_w");
-
-  CHK(m->w.wq, L * (size_t)p->dim * p->dim, "wq");
-  CHK(m->w.wk, L * (size_t)kv_dim * p->dim, "wk");
-  CHK(m->w.wv, L * (size_t)kv_dim * p->dim, "wv");
-  CHK(m->w.wo, L * (size_t)p->dim * p->dim, "wo");
-
-  CHK(m->w.bq, L * p->dim, "bq");
-  CHK(m->w.bk, L * kv_dim, "bk");
-  CHK(m->w.bv, L * kv_dim, "bv");
-  CHK(m->w.bo, L * p->dim, "bo");
-
-  CHK(m->w.attn_sink, L * p->n_heads, "attn_sink");
-
-  if (p->n_experts > 0) {
-    CHK(m->w.wr, L * E * p->dim, "wr");
-    CHK(m->w.br, L * E, "br");
-    CHK(m->w.w_up, L * E * (size_t)p->hidden_dim * p->dim, "w_up");
-    CHK(m->w.w_gate, L * E * (size_t)p->hidden_dim * p->dim, "w_gate");
-    CHK(m->w.w_down, L * E * (size_t)p->dim * p->hidden_dim, "w_down");
-    CHK(m->w.b_up, L * E * (size_t)p->hidden_dim, "b_up");
-    CHK(m->w.b_gate, L * E * (size_t)p->hidden_dim, "b_gate");
-    CHK(m->w.b_down, L * E * p->dim, "b_down");
-  }
-
-  CHK(m->w.rms_final_w, p->dim, "rms_final_w");
-
-  if ((uint8_t *)m->w.wcls != (uint8_t *)m->w.tok_embeddings) {
-    CHK(m->w.wcls, (size_t)p->vocab_size * p->dim, "wcls");
-  }
-
-#undef CHK
-
-  fprintf(stderr,
-          "[VERIFY] header: dim=%d hidden=%d L=%d H=%d KV=%d E=%d K=%d "
-          "vocab=%d seq=%d win=%d alt=%d rope_base=%g rope_scale=%g\n",
-          p->dim, p->hidden_dim, p->n_layers, p->n_heads, p->n_kv_heads,
-          p->n_experts, p->top_k, p->vocab_size, p->seq_len, p->window,
-          p->alt_banded, p->rope_base, p->rope_scale);
-}
-
-static void read_checkpoint_or_die(const char *path, GPTOSSModel *m) {
+// ---------- mmap ----------
+static void map_or_die(const char *path, GPTOSSModel *m) {
   memset(m, 0, sizeof(*m));
   m->fd = open(path, O_RDONLY);
   if (m->fd == -1) {
     perror("open");
     exit(1);
   }
-
-  off_t fsz = lseek(m->fd, 0, SEEK_END);
-  if (fsz <= 0) {
+  off_t sz = lseek(m->fd, 0, SEEK_END);
+  if (sz <= 0) {
     fprintf(stderr, "bad file size\n");
     exit(1);
   }
-  m->file_size = (size_t)fsz;
+  m->file_size = (size_t)sz;
   if (lseek(m->fd, 0, SEEK_SET) < 0) {
     perror("lseek");
     exit(1);
   }
-
   m->mapped = mmap(NULL, m->file_size, PROT_READ, MAP_PRIVATE, m->fd, 0);
   if (m->mapped == MAP_FAILED) {
     perror("mmap");
     exit(1);
   }
 
-  // Copy header (packed)
   memcpy(&m->cfg, m->mapped, sizeof(GPTOSSConfig));
+  m->tied = (m->cfg.vocab_size < 0);
+  if (m->tied)
+    m->cfg.vocab_size = -m->cfg.vocab_size;
+
   if (!(m->cfg.rope_scale > 0.0f) || !isfinite(m->cfg.rope_scale))
     m->cfg.rope_scale = 1.0f;
   if (!(m->cfg.rope_base > 0.0f) || !isfinite(m->cfg.rope_base))
     m->cfg.rope_base = 10000.0f;
+}
 
-  int shared = (m->cfg.vocab_size < 0) ? 1 : 0;
-  m->cfg.vocab_size = abs(m->cfg.vocab_size);
+// ---------- UPDATED: map with sinks-sized-by-q_heads + optional MoE ----------
+static void memory_map_weights(GPTOSSWeights *w, const GPTOSSConfig *p,
+                               float *ptr, int shared, int q_dim, int kv_dim,
+                               int sink_heads, int n_experts) {
+  size_t L = (size_t)p->n_layers, D = (size_t)p->dim, V = (size_t)p->vocab_size,
+         H = (size_t)p->hidden_dim;
 
+  w->tok_embeddings = ptr;
+  ptr += V * D;
+
+  w->rms_att_w = ptr;
+  ptr += L * D;
+  w->rms_ffn_w = ptr;
+  ptr += L * D;
+
+  w->wq = ptr;
+  ptr += L * (size_t)q_dim * D;
+  w->wk = ptr;
+  ptr += L * (size_t)kv_dim * D;
+  w->wv = ptr;
+  ptr += L * (size_t)kv_dim * D;
+  w->wo = ptr;
+  ptr += L * D * (size_t)q_dim;
+
+  w->bq = ptr;
+  ptr += L * (size_t)q_dim;
+  w->bk = ptr;
+  ptr += L * (size_t)kv_dim;
+  w->bv = ptr;
+  ptr += L * (size_t)kv_dim;
+  w->bo = ptr;
+  ptr += L * D;
+
+  w->attn_sink = ptr;
+  ptr += L * (size_t)sink_heads;
+
+  // Optional MoE block (8 parts)
+  if (n_experts > 0) {
+    w->wr = ptr;
+    ptr += L * (size_t)n_experts * D;
+    w->br = ptr;
+    ptr += L * (size_t)n_experts;
+    w->wup = ptr;
+    ptr += L * (size_t)n_experts * H * D;
+    w->wgate = ptr;
+    ptr += L * (size_t)n_experts * H * D;
+    w->wdown = ptr;
+    ptr += L * (size_t)n_experts * D * H;
+    w->bup = ptr;
+    ptr += L * (size_t)n_experts * H;
+    w->bgate = ptr;
+    ptr += L * (size_t)n_experts * H;
+    w->bdown = ptr;
+    ptr += L * (size_t)n_experts * D;
+  } else {
+    w->wr = w->br = w->wup = w->wgate = w->wdown = w->bup = w->bgate =
+        w->bdown = NULL;
+  }
+
+  w->rms_final_w = ptr;
+  ptr += D;
+  w->wcls = shared ? w->tok_embeddings : ptr;
+}
+
+// ---------- solve (head_dim, kv_dim, q_dim) by scanning head_dim ----------
+static int solve_dims_from_size(const GPTOSSConfig *p, size_t floats_after_hdr,
+                                int tied, int *out_head_dim, int *out_kv_dim,
+                                int *out_q_dim, int *out_q_heads) {
+  // fixed sections independent of q_dim/kv_dim
+  const size_t L = (size_t)p->n_layers, D = (size_t)p->dim,
+               V = (size_t)p->vocab_size;
+  size_t prefix = V * D + L * D * 2;           // embeddings + two RMS
+  size_t tail_fixed = L * (size_t)D            // BO
+                      + L * (size_t)p->n_heads // attn_sinks
+                      + D;                     // final RMS
+  size_t lm_tail = tied ? 0 : V * D;
+
+  // try common head_dim values (put 64 first; you can extend list if needed)
+  const int cand[] = {64, 80, 96, 128, 48, 40, 32};
+  const int NC = (int)(sizeof(cand) / sizeof(cand[0]));
+  for (int ci = 0; ci < NC; ++ci) {
+    int head_dim = cand[ci];
+    int kv_dim = head_dim * p->n_kv_heads; // K,V rows
+    // parts that depend on kv_dim but not on q_dim
+    size_t kv_block =
+        L * ((size_t)2 * kv_dim * D + (size_t)2 * kv_dim); // WK+WV and BK+BV
+    // remainder should correspond to q parts: L*(2*q_dim*D + q_dim)
+    if (floats_after_hdr < prefix + kv_block + tail_fixed + lm_tail)
+      continue;
+    size_t rem = floats_after_hdr - prefix - kv_block - tail_fixed - lm_tail;
+    size_t coeff = L * ((size_t)2 * D + 1);
+    if (coeff == 0 || rem % coeff)
+      continue;
+    size_t q_dim = rem / coeff;
+    if (q_dim == 0 || (q_dim % (size_t)head_dim))
+      continue;
+    int q_heads = (int)(q_dim / (size_t)head_dim);
+    if (q_heads <= 0)
+      continue;
+
+    // found a consistent solution
+    *out_head_dim = head_dim;
+    *out_kv_dim = kv_dim;
+    *out_q_dim = (int)q_dim;
+    *out_q_heads = q_heads;
+    return 1;
+  }
+  return 0;
+}
+
+// ---------- build with verification ----------
+// ---------- UPDATED: builder (verify + clamp seq_len) ----------
+static void gptoss_build(GPTOSSModel *m, const char *bin_path, int verbose) {
+  map_or_die(bin_path, m);
+  GPTOSSConfig *p = &m->cfg;
+
+  // sanity / clamps
+  if (!(p->rope_scale > 0.0f) || !isfinite(p->rope_scale))
+    p->rope_scale = 1.0f;
+  if (!(p->rope_base > 0.0f) || !isfinite(p->rope_base))
+    p->rope_base = 10000.0f;
+  if (p->seq_len > 16384) {
+    fprintf(stderr, "[WARN] clamping seq_len %d -> 4096\n", p->seq_len);
+    p->seq_len = 4096;
+  }
+
+  const size_t floats_after_hdr =
+      (m->file_size - sizeof(GPTOSSConfig)) / sizeof(float);
+
+  int head_dim = -1, kv_dim = -1, q_dim = -1, q_heads = -1, sink_heads = -1,
+      n_experts = -1;
+  if (!solve_dims_moe_aware(p, floats_after_hdr, m->tied, &head_dim, &kv_dim,
+                            &q_dim, &q_heads, &sink_heads, &n_experts)) {
+    fprintf(stderr, "[ERR] could not infer dims/experts from file size. Export "
+                    "layout mismatch.\n");
+    exit(1);
+  }
+
+  // fill run-state & override obviously-wrong header fields
+  m->s.head_dim = head_dim;
+  m->s.kv_dim = kv_dim;
+  m->s.q_dim = q_dim;
+  m->s.q_heads = q_heads;
+  m->s.sink_heads = sink_heads;
+  if (n_experts >= 0)
+    p->n_experts = n_experts; // trust the file, not the header
+
+  if (verbose) {
+    fprintf(stderr,
+            "[VERIFY] header(raw): dim=%d hidden=%d L=%d n_heads(hdr)=%d "
+            "n_kv=%d E(hdr)=%d top_k=%d vocab=%d seq=%d win=%d alt=%d "
+            "rope_base=%.1f rope_scale=%.3f tied=%d\n",
+            p->dim, p->hidden_dim, p->n_layers,
+            ((GPTOSSConfig *)m->mapped)->n_heads, p->n_kv_heads, p->n_experts,
+            p->top_k, p->vocab_size, p->seq_len, p->window, p->alt_banded,
+            p->rope_base, p->rope_scale, m->tied);
+    fprintf(stderr,
+            "[VERIFY] derived: head_dim=%d kv_dim=%d q_dim=%d q_heads=%d "
+            "sink_heads=%d experts=%d\n",
+            head_dim, kv_dim, q_dim, q_heads, sink_heads, p->n_experts);
+  }
+
+  // map weights with derived sizes (sinks sized by q_heads)
   float *ptr = (float *)((uint8_t *)m->mapped + sizeof(GPTOSSConfig));
-  memory_map_weights(&m->w, &m->cfg, ptr, shared);
+  memory_map_weights(&m->w, p, ptr, m->tied, q_dim, kv_dim, sink_heads,
+                     p->n_experts);
+
+  // final recount including optional MoE and sinks=q_heads
+  const size_t L = (size_t)p->n_layers, D = (size_t)p->dim,
+               V = (size_t)p->vocab_size, H = (size_t)p->hidden_dim;
+  size_t expect = 0;
+  expect += V * D;                      // embeddings
+  expect += L * D + L * D;              // two RMS
+  expect += L * (size_t)q_dim * D;      // WQ
+  expect += L * (size_t)kv_dim * D * 2; // WK+WV
+  expect += L * D * (size_t)q_dim;      // WO
+  expect += L * (size_t)q_dim;          // BQ
+  expect += L * (size_t)kv_dim * 2;     // BK+BV
+  expect += L * D;                      // BO
+  expect += L * (size_t)sink_heads;     // sinks
+  if (p->n_experts > 0) {
+    expect += L * (size_t)p->n_experts * D;         // WR
+    expect += L * (size_t)p->n_experts;             // BR
+    expect += L * (size_t)p->n_experts * H * D * 2; // WUP + WGATE
+    expect += L * (size_t)p->n_experts * D * H;     // WDOWN
+    expect += L * (size_t)p->n_experts * H * 2;     // BUP + BGATE
+    expect += L * (size_t)p->n_experts * D;         // BDOWN
+  }
+  expect += D; // final RMS
+  if (!m->tied)
+    expect += V * D; // lm head
+
+  if (expect != floats_after_hdr) {
+    fprintf(stderr, "[ERR] recount mismatch: file=%zu floats, expect=%zu\n",
+            floats_after_hdr, expect);
+    exit(1);
+  }
+
+  malloc_run_state(&m->s, p);
 }
 
-static void build_model_or_die(GPTOSSModel *m, const char *checkpoint,
-                               int verify_verbose) {
-  read_checkpoint_or_die(checkpoint, m);
-  verify_or_die(m, verify_verbose);
-  malloc_run_state(&m->s, &m->cfg);
-}
-
-static void free_model(GPTOSSModel *m) {
-  if (m->mapped && m->mapped != MAP_FAILED)
-    munmap(m->mapped, m->file_size);
-  if (m->fd != -1)
-    close(m->fd);
-  free_run_state(&m->s);
-}
-
-// ------------------------------ RoPE (split-halves)
-
+// ---------- YaRN-style RoPE (same schedule you described) ----------
 #define YARN_ALPHA 1.0f
 #define YARN_BETA 32.0f
 static inline float yarn_gamma(float r) {
@@ -505,74 +526,74 @@ static inline float yarn_gamma(float r) {
     return 1.0f;
   return (r - YARN_ALPHA) / (YARN_BETA - YARN_ALPHA);
 }
-
-static inline void apply_rope_yarn_halves(float *vec, int size, int head_size,
-                                          int pos, float rope_base, float s,
-                                          int L_new) {
+static inline void apply_rope_yarn_heads(float *vec, int n_heads, int head_dim,
+                                         int pos, float rope_base, float s,
+                                         int L_new) {
   if (!(s > 0.0f))
     s = 1.0f;
   if (s > 1024.0f)
     s = 1024.0f;
+  const int H = head_dim, HH = H >> 1;
+  const float conc = (s > 1.0f) ? (1.0f + 0.1f * logf(s)) : 1.0f;
+  const float Lorig = s * (float)L_new;
 
-  const int H = head_size;
-  const int HH = H >> 1;
-  const int n_heads_here = size / H;
-  const float concentration = (s > 1.0f) ? (1.0f + 0.1f * logf(s)) : 1.0f;
-  const float L_orig_scale = s * (float)L_new;
-
-  for (int h = 0; h < n_heads_here; h++) {
-    float *base = vec + h * H;
-    for (int j = 0; j < HH; j++) {
-      float inv_freq = powf(rope_base, -(2.0f * (float)j) / (float)H);
-      float r = L_orig_scale * inv_freq;
+  for (int h = 0; h < n_heads; ++h) {
+    float *b = vec + (size_t)h * H;
+    for (int j = 0; j < HH; ++j) {
+      float invf = powf(rope_base, -(2.0f * (float)j) / (float)H);
+      float r = Lorig * invf;
       float g = yarn_gamma(r);
       float m = s * (1.0f - g) + 1.0f * g;
-      float angle = (float)pos * (m * inv_freq);
-      float c = cosf(angle), sd = sinf(angle);
-      float v1 = base[j];
-      float v2 = base[j + HH];
-      base[j] = concentration * (v1 * c - v2 * sd);
-      base[j + HH] = concentration * (v1 * sd + v2 * c);
+      float ang = (float)pos * (m * invf);
+      float c = cosf(ang), sd = sinf(ang);
+      float x0 = b[j], x1 = b[j + HH];
+      b[j] = conc * (x0 * c - x1 * sd);
+      b[j + HH] = conc * (x0 * sd + x1 * c);
     }
   }
 }
 
-// ------------------------------ forward (single token)
+// ---------- forward one token ----------
+static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
+static inline float silu(float x) { return x * sigmoidf(x); }
 
-static float *forward_token(GPTOSSModel *m, int token, int pos) {
+static float *gptoss_forward(GPTOSSModel *m, int token, int pos) {
   GPTOSSConfig *p = &m->cfg;
   GPTOSSWeights *w = &m->w;
   RunState *s = &m->s;
+  const int dim = p->dim, head_dim = s->head_dim, kv_dim = s->kv_dim,
+            q_dim = s->q_dim, q_heads = s->q_heads;
 
-  const int dim = p->dim;
-  const int head_size = dim / p->n_heads;
-  const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-
+  // token embedding
   memcpy(s->x, w->tok_embeddings + (size_t)token * dim, sizeof(float) * dim);
 
-  for (int l = 0; l < p->n_layers; l++) {
+  for (int l = 0; l < p->n_layers; ++l) {
+    // --- Attention ---
     rmsnorm(s->xb, s->x, w->rms_att_w + (size_t)l * dim, dim);
 
-    matmul(s->q, s->xb, w->wq + (size_t)l * dim * dim, dim, dim);
-    matmul(s->k, s->xb, w->wk + (size_t)l * kv_dim * dim, dim, kv_dim);
-    matmul(s->v, s->xb, w->wv + (size_t)l * kv_dim * dim, dim, kv_dim);
+    matmul(s->q, s->xb, w->wq + (size_t)l * (size_t)q_dim * dim, dim, q_dim);
+    matmul(s->k, s->xb, w->wk + (size_t)l * (size_t)kv_dim * dim, dim, kv_dim);
+    matmul(s->v, s->xb, w->wv + (size_t)l * (size_t)kv_dim * dim, dim, kv_dim);
 
-    for (int i = 0; i < dim; i++)
-      s->q[i] += w->bq[(size_t)l * dim + i];
+    for (int i = 0; i < q_dim; i++)
+      s->q[i] += w->bq[(size_t)l * q_dim + i];
     for (int i = 0; i < kv_dim; i++)
       s->k[i] += w->bk[(size_t)l * kv_dim + i];
     for (int i = 0; i < kv_dim; i++)
       s->v[i] += w->bv[(size_t)l * kv_dim + i];
 
-    apply_rope_yarn_halves(s->q, dim, head_size, pos, p->rope_base,
-                           p->rope_scale, p->seq_len);
-    apply_rope_yarn_halves(s->k, kv_dim, head_size, pos, p->rope_base,
-                           p->rope_scale, p->seq_len);
+    apply_rope_yarn_heads(s->q, q_heads, head_dim, pos, p->rope_base,
+                          p->rope_scale, p->seq_len);
+    apply_rope_yarn_heads(s->k, p->n_kv_heads, head_dim, pos, p->rope_base,
+                          p->rope_scale, p->seq_len);
 
-    const size_t loff = (size_t)l * p->seq_len * kv_dim + (size_t)pos * kv_dim;
+    // KV cache write
+    const size_t loff =
+        (size_t)l * p->seq_len * (size_t)kv_dim + (size_t)pos * (size_t)kv_dim;
     memcpy(s->key_cache + loff, s->k, kv_dim * sizeof(float));
     memcpy(s->val_cache + loff, s->v, kv_dim * sizeof(float));
 
+    // banded window?
     int apply_window = 0;
     if (p->window > 0) {
       if (p->alt_banded == 0)
@@ -591,136 +612,153 @@ static float *forward_token(GPTOSSModel *m, int token, int pos) {
         t_start = wstart;
     }
 
-    memset(s->xb, 0, (size_t)dim * sizeof(float));
+    memset(s->xq, 0, (size_t)q_dim * sizeof(float));
 
-    for (int h = 0; h < p->n_heads; h++) {
-      float *q = s->q + (size_t)h * head_size;
+    for (int h = 0; h < q_heads; ++h) {
+      float *qh = s->q + (size_t)h * head_dim;
       float *att = s->att + (size_t)h * p->seq_len;
 
-      for (int t = t_start; t <= pos; t++) {
-        const float *krow = s->key_cache + (size_t)l * p->seq_len * kv_dim +
-                            (size_t)t * kv_dim +
-                            (size_t)(h % p->n_kv_heads) * head_size;
+      for (int t = t_start; t <= pos; ++t) {
+        const float *krow =
+            s->key_cache + (size_t)l * p->seq_len * (size_t)kv_dim +
+            (size_t)t * (size_t)kv_dim + (size_t)(h % p->n_kv_heads) * head_dim;
         float score = 0.0f;
-        for (int i = 0; i < head_size; i++)
-          score += q[i] * krow[i];
-        att[t] = score / sqrtf((float)head_size);
+        for (int i = 0; i < head_dim; i++)
+          score += qh[i] * krow[i];
+        att[t] = score / sqrtf((float)head_dim);
       }
 
+      // softmax over [t_start..pos] with learned sink in denominator
       float mx = -1e30f;
-      for (int t = t_start; t <= pos; t++)
+      for (int t = t_start; t <= pos; ++t)
         if (att[t] > mx)
           mx = att[t];
       float sum = 0.0f;
-      for (int t = t_start; t <= pos; t++) {
+      for (int t = t_start; t <= pos; ++t) {
         float e = expf(att[t] - mx);
         att[t] = e;
         sum += e;
       }
-      float sink = w->attn_sink[(size_t)l * p->n_heads + h];
+      float sink =
+          w->attn_sink[(size_t)l * (size_t)p->n_heads + (h % p->n_heads)];
       sum += expf(sink - mx);
       float inv = 1.0f / sum;
-      for (int t = t_start; t <= pos; t++)
+      for (int t = t_start; t <= pos; ++t)
         att[t] *= inv;
 
-      float *out = s->xb + (size_t)h * head_size;
-      for (int t = t_start; t <= pos; t++) {
+      float *out = s->xq + (size_t)h * head_dim;
+      for (int t = t_start; t <= pos; ++t) {
         const float a = att[t];
-        const float *vrow = s->val_cache + (size_t)l * p->seq_len * kv_dim +
-                            (size_t)t * kv_dim +
-                            (size_t)(h % p->n_kv_heads) * head_size;
-        for (int i = 0; i < head_size; i++)
+        const float *vrow =
+            s->val_cache + (size_t)l * p->seq_len * (size_t)kv_dim +
+            (size_t)t * (size_t)kv_dim + (size_t)(h % p->n_kv_heads) * head_dim;
+        for (int i = 0; i < head_dim; i++)
           out[i] += a * vrow[i];
       }
     }
 
-    matmul(s->xb2, s->xb, w->wo + (size_t)l * dim * dim, dim, dim);
+    // out proj + bias + residual
+    matmul(s->xb2, s->xq, w->wo + (size_t)l * (size_t)dim * (size_t)q_dim,
+           q_dim, dim);
     for (int i = 0; i < dim; i++)
       s->x[i] += s->xb2[i] + w->bo[(size_t)l * dim + i];
 
-    // MoE
+    // --- FFN (dense in your checkpoint) ---
     rmsnorm(s->xb, s->x, w->rms_ffn_w + (size_t)l * dim, dim);
 
-    if (p->n_experts > 0 && p->top_k > 0) {
-      matmul(s->router, s->xb, w->wr + (size_t)l * p->n_experts * dim, dim,
-             p->n_experts);
-      for (int e = 0; e < p->n_experts; e++)
-        s->router[e] += w->br[(size_t)l * p->n_experts + e];
+    if (p->n_experts > 0) {
+      // Router logits r[E] = WR[E,dim] @ xb + BR[E]
+      const int E = p->n_experts, H = p->hidden_dim;
+      float *r = s->router;
+      for (int e = 0; e < E; e++) {
+        const float *we = w->wr + (size_t)l * E * dim + (size_t)e * dim;
+        float sum = 0.0f;
+        for (int i = 0; i < dim; i++)
+          sum += we[i] * s->xb[i];
+        r[e] = sum + w->br[(size_t)l * E + e];
+      }
+      // pick top-k
+      int tk = p->top_k > 0 && p->top_k < E ? p->top_k : (E < 4 ? E : 4);
+      topk_indices(r, E, tk, s->topk_idx, s->topk_weight);
+      // softmax over selected logits
+      float mx = s->topk_weight[0];
+      for (int i = 1; i < tk; i++)
+        if (s->topk_weight[i] > mx)
+          mx = s->topk_weight[i];
+      float Z = 0.0f;
+      for (int i = 0; i < tk; i++) {
+        s->topk_weight[i] = expf(s->topk_weight[i] - mx);
+        Z += s->topk_weight[i];
+      }
+      for (int i = 0; i < tk; i++)
+        s->topk_weight[i] /= Z;
 
-      float topv[256]; // enough
-      topk_indices(s->router, p->n_experts, p->top_k, s->topk_idx, topv);
-      for (int i = 0; i < p->top_k; i++)
-        s->topk_weight[i] = topv[i];
-      softmax_inplace(s->topk_weight, p->top_k);
+      // mixture accumulation
+      memset(s->hb2, 0, sizeof(float) * dim); // reuse hb2(dim) as output acc
+      for (int j = 0; j < tk; j++) {
+        const int e = s->topk_idx[j];
+        const float mix = s->topk_weight[j];
 
-      memset(s->xb2, 0, (size_t)dim * sizeof(float));
-      const float alpha = 1.702f, limit = 7.0f;
-
-      for (int r = 0; r < p->top_k; r++) {
-        const int e = s->topk_idx[r];
-        if (e < 0)
-          continue;
-        const float w_r = s->topk_weight[r];
-
-        const size_t up_off =
-            ((size_t)l * p->n_experts + e) * (size_t)p->hidden_dim * p->dim;
-        const size_t gate_off = up_off;
-        const size_t down_off =
-            ((size_t)l * p->n_experts + e) * (size_t)p->dim * p->hidden_dim;
-
-        const size_t bu_off =
-            ((size_t)l * p->n_experts + e) * (size_t)p->hidden_dim;
-        const size_t bg_off = bu_off;
-        const size_t bd_off = ((size_t)l * p->n_experts + e) * (size_t)p->dim;
-
-        matmul(s->hb, s->xb, w->w_up + up_off, p->dim, p->hidden_dim);
-        for (int i = 0; i < p->hidden_dim; i++)
-          s->hb[i] += w->b_up[bu_off + i];
-
-        matmul(s->hb2, s->xb, w->w_gate + gate_off, p->dim, p->hidden_dim);
-        for (int i = 0; i < p->hidden_dim; i++)
-          s->hb2[i] += w->b_gate[bg_off + i];
-
-        for (int i = 0; i < p->hidden_dim; i++) {
-          float u = s->hb[i], g = s->hb2[i];
-          if (u > limit)
-            u = limit;
-          if (g > limit)
-            g = limit;
-          if (g < -limit)
-            g = -limit;
-          float silu = u * (1.0f / (1.0f + expf(-alpha * u)));
-          s->hb[i] = silu * (g + 1.0f);
+        // up = WUP[e] @ xb + bup[e]   [H]
+        float *up = s->hb;
+        memset(up, 0, sizeof(float) * H);
+        const float *WUP =
+            w->wup + ((size_t)l * E + e) * (size_t)H * (size_t)dim;
+        for (int h = 0; h < H; ++h) {
+          const float *row = WUP + (size_t)h * dim;
+          float ssum = 0.0f;
+          for (int i = 0; i < dim; i++)
+            ssum += row[i] * s->xb[i];
+          up[h] = ssum + w->bup[(size_t)l * E * H + (size_t)e * H + h];
         }
 
-        matmul(s->xb, s->hb, w->w_down + down_off, p->hidden_dim, p->dim);
-        for (int i = 0; i < p->dim; i++)
-          s->xb[i] += w->b_down[bd_off + i];
+        // gate = WGATE[e] @ xb + bgate[e] ; act = silu(gate) * up   [H]
+        const float *WG =
+            w->wgate + ((size_t)l * E + e) * (size_t)H * (size_t)dim;
+        for (int h = 0; h < H; ++h) {
+          const float *row = WG + (size_t)h * dim;
+          float gsum = 0.0f;
+          for (int i = 0; i < dim; i++)
+            gsum += row[i] * s->xb[i];
+          float g = gsum + w->bgate[(size_t)l * E * H + (size_t)e * H + h];
+          up[h] = silu(g) * up[h];
+        }
 
-        for (int i = 0; i < p->dim; i++)
-          s->xb2[i] += w_r * s->xb[i];
+        // down = WDOWN[e] @ act + bdown[e]   [dim]
+        const float *WD =
+            w->wdown + ((size_t)l * E + e) * (size_t)dim * (size_t)H;
+        for (int i = 0; i < dim; i++) {
+          const float *row = WD + (size_t)i * H;
+          float dsum = 0.0f;
+          for (int h = 0; h < H; ++h)
+            dsum += row[h] * up[h];
+          s->xb2[i] =
+              dsum + w->bdown[(size_t)l * E * dim + (size_t)e * dim + i];
+        }
+        for (int i = 0; i < dim; i++)
+          s->hb2[i] += mix * s->xb2[i];
       }
 
-      for (int i = 0; i < p->dim; i++)
-        s->x[i] += s->xb2[i];
+      // residual
+      for (int i = 0; i < dim; i++)
+        s->x[i] += s->hb2[i];
+
+    } else {
+      // dense path not present in this checkpoint; keep as no-op
     }
   }
 
-  rmsnorm(s->x, s->x, w->rms_final_w, p->dim);
-  matmul(s->logits, s->x, w->wcls, p->dim, p->vocab_size);
+  // final norm + logits
+  rmsnorm(s->x, s->x, w->rms_final_w, dim);
+  matmul(s->logits, s->x, w->wcls, dim, p->vocab_size);
   return s->logits;
 }
 
-// ------------------------------ public-ish API
-
-// Build with verification (verbose: 0/1)
-static void gptoss_build(GPTOSSModel *m, const char *bin_path,
-                         int verify_verbose) {
-  build_model_or_die(m, bin_path, verify_verbose);
-}
-
-static void gptoss_free(GPTOSSModel *m) { free_model(m); }
-
-static float *gptoss_forward(GPTOSSModel *m, int token, int pos) {
-  return forward_token(m, token, pos);
+// ---------- free ----------
+static void gptoss_free(GPTOSSModel *m) {
+  if (m->mapped && m->mapped != MAP_FAILED)
+    munmap(m->mapped, m->file_size);
+  if (m->fd != -1)
+    close(m->fd);
+  free_run_state(&m->s);
 }

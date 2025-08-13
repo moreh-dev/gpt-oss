@@ -38,3 +38,12 @@ Or run the Python test harness:
 ```bash
 python test_tokenizer.py --bin ./test_tokenizer --tok ./tokenizer.bin --verbose --prompt prompts.txt
 ```
+
+```bash
+make gpt-oss
+./gpt-oss gpt-oss-20b.bin -i "Hello" -n 64 -t tokenizer.bin
+```
+
+```bash
+python export_model_bin.py ./gpt-oss-20b ./gpt-oss-20b.bin --verify
+```
