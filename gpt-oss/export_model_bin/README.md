@@ -5,4 +5,6 @@
 
 # Note
 - Run convert_state_dict.py to convert the keys weights to the format accepted by [gpt-oss git repo](https://github.com/openai/gpt-oss/tree/main/gpt_oss)
+  - For tiny-random's weights, this script renames tensors' keys
+  - For openai's weights, this script dequantizes MoE weights as it is stored in MXFP4 format
 - Then run generate_bin.py to generate weights + config in .bin format
