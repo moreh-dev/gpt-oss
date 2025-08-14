@@ -1096,7 +1096,11 @@ int main(int argc, char **argv) {
     // run!
 	//generate(&transformer, &tokenizer, &sampler, prompt, steps);
 
-	float* logits = forward(&transformer, 10, 0);
+	float* logits = forward(&transformer, 1023, 0);
+
+	FILE *f = fopen("logits.bin",  "wb");
+	fwrite(logits, sizeof(float), transformer.config.vocab_size, f);
+	fclose(f);
 
     // memory and file handles cleanup
     free_sampler(&sampler);
