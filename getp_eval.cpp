@@ -8,7 +8,7 @@
 #define GETP_EVAL
 
 typedef struct {
-  int num_reqs;		// number of reqeusts;
+  int num_reqs;		// number of requests;
   int max_token_len;  // maximum size of token
   int max_seq_len;	// maximum number of sequence
   char* str_reqs;		// buffer for request strings
@@ -92,7 +92,7 @@ int write_outputfile(const char* output_filename, Requests* reqs) {
 }
 
 void warm_up(Transformer* transformer, Tokenizer* tokenizer, Requests* requests);
-long long inference(Transformer* transformer, Tokenizer* tokenizer, Requests* requests);
+long long inference(Transformer* transformer, Tokenizer* tokenizer, Sampler* sample, Requests* requests);
 
 void getp(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char* input_filename, char* output_filename, int steps) {
   Requests requests;
@@ -115,7 +115,7 @@ void getp(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
   printf("warm up elapsed time(s): %f\n", (double)(end-start)/1000);
 
   start = time_in_ms();
-  int num_gen_tokens = inference(transformer, tokenizer, &requests);
+  long long num_gen_tokens = inference(transformer, tokenizer, sampler, &requests);
   end = time_in_ms();
   // Your goal is to achieve best throughput(=reduce elapsed time)! 
   fprintf(stdout, "elapsed time(s): %f, achieved throughput TPS (tok/s): %f\n", (double)(end-start)/1000, (num_gen_tokens) / (double)(end-start)*1000);

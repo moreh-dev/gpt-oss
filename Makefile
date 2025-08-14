@@ -67,4 +67,3 @@ testcc:
 .PHONY: clean
 clean:
 	rm -f run
-	rm -f runq

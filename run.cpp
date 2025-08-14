@@ -365,7 +365,7 @@ float* forward(Transformer* transformer, int token, int pos) {
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
 typedef struct {
-    char *str;
+    const char *str;
     int id;
 } TokenIndex;
 
@@ -382,7 +382,7 @@ int compare_tokens(const void *a, const void *b) {
     return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
 
-void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
+void build_tokenizer(Tokenizer* t, const char* tokenizer_path, int vocab_size) {
     // i should have written the vocab_size into the tokenizer file... sigh
     t->vocab_size = vocab_size;
     // malloc space to hold the scores and the strings
@@ -442,14 +442,14 @@ void safe_printf(char *piece) {
     printf("%s", piece);
 }
 
-int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
+int str_lookup(const char *str, TokenIndex *sorted_vocab, int vocab_size) {
     // efficiently find the perfect match for str in vocab, return its index or -1 if not found
     TokenIndex tok = { .str = str }; // acts as the key to search for
     TokenIndex *res = reinterpret_cast<TokenIndex*>(bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens));
     return res != NULL ? res->id : -1;
 }
 
-void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
+void encode(Tokenizer* t, const char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
     // encode the string text (input) into an upper-bound preallocated tokens[] array
     // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
     if (text == NULL) { fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE); }
@@ -493,7 +493,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
 
     // process the raw (UTF-8) byte sequence of the input string
-    for (char *c = text; *c != '\0'; c++) {
+    for (const char *c = text; *c != '\0'; c++) {
 
         // reset buffer if the current byte is ASCII or a leading byte
         // 0xC0 is 11000000, so (*c & 0xC0) keeps the first 2 bits and zeros the rest
@@ -726,8 +726,8 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
-    char *empty_prompt = "";
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, const char *prompt, int steps) {
+    const char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
     // encode the (string) prompt into tokens sequence
@@ -883,8 +883,8 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     free(prompt_tokens);
 }
 
-#include "getp_eval.inc"
-#include "getp_run.inc"
+#include "getp_eval.cpp"
+#include "getp_run.cpp"
 
 // ----------------------------------------------------------------------------
 // CLI, include only if not testing
@@ -894,13 +894,13 @@ void error_usage() {
     fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
     fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
+    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 0.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
     fprintf(stderr, "  -i <string> input prompt\n");
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-    fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
+    fprintf(stderr, "  -m <string> mode: generate|chat|getp, default: generate\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
     fprintf(stderr, "  -f <string> (optional) input file in getp mode\n");
     fprintf(stderr, "  -o <string> (optional) output file in getp mode\n");
@@ -911,13 +911,13 @@ int main(int argc, char *argv[]) {
 
     // default parameters
     char *checkpoint_path = NULL;  // e.g. out/model.bin
-    char *tokenizer_path = "tokenizer.bin";
-    float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
+    const char *tokenizer_path = "tokenizer.bin";
+    float temperature = 0.0f;   // 0.0 = greedy deterministic. 0.0 = original. don't set higher
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     int steps = 256;            // number of steps to run for
     char *prompt = NULL;        // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
-    char *mode = "generate";    // generate|chat
+    const char *mode = "generate";  // generate|chat|getp
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
     char *input_filename = NULL;
     char *output_filename = NULL;
