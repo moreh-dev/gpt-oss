@@ -4,8 +4,8 @@ CC = gcc
 
 # the most basic way of building that is most likely to work on most systems
 .PHONY: run
-run: run.c
-	$(CC) -g -O0 -o run run.c -lm
+run: run.c tokenizer.h tokenizer.c
+	$(CC) -g -O0 -o run run.c tokenizer.h tokenizer.c -lm
 	# $(CC) -O3 -o runq runq.c -lm
 
 # useful for a debug build, can then e.g. analyze with valgrind, example:
