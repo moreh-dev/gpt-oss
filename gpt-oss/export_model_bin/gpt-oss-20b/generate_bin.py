@@ -19,11 +19,12 @@ KEYS = [
 		"head_dim", 
 		"num_attention_heads", 
 		"num_key_value_heads", 
-		#"max_seq_len",
-		#"initial_context_length", 
-		#"rope_theta", 
-		#"sliding_window", 
-		#"swiglu_limit"
+		"max_seq_len",
+		"initial_context_length", 
+		"rope_theta", 
+		"rope_scaling_factor",
+		"sliding_window", 
+		"swiglu_limit"
 ]
 
 CATEGORIES = [
@@ -78,7 +79,8 @@ def binarize_weights(state_dict, dtype="float32"):
 
 	reordered = OrderedDict()
 	for cat in CATEGORIES:
-		for _, key in buckets[cat]:
+		sorted_bucket = sorted(buckets[cat], key=lambda x: x[0])
+		for _, key in sorted_bucket:
 			reordered[key] = state_dict[key]
 	for key in sorted(others):
 		reordered[key] = state_dict[key]
@@ -90,6 +92,7 @@ def binarize_weights(state_dict, dtype="float32"):
 	for name, tensor in reordered.items():
 		np_tensor = tensor.detach().cpu().to(torch_dtype).numpy().astype(np_dtype)
 		weights_bin += np_tensor.tobytes()
+		print(f"Binarized {name}")
 
 	return weights_bin
 
@@ -102,5 +105,6 @@ if __name__ == "__main__":
 
 	state_dict = load_file("model.safetensors")
 	weights_bin = binarize_weights(state_dict)
+	print("Writing to file ...")
 	with open("gpt-oss-20B.bin", "wb") as f:
 		f.write(config_bin + weights_bin)
