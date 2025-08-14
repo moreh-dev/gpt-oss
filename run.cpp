@@ -912,7 +912,7 @@ int main(int argc, char *argv[]) {
     // default parameters
     char *checkpoint_path = NULL;  // e.g. out/model.bin
     const char *tokenizer_path = "tokenizer.bin";
-    float temperature = 0.0f;   // 0.0 = greedy deterministic. 0.0 = original. don't set higher
+    float temperature = 0.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     int steps = 256;            // number of steps to run for
     char *prompt = NULL;        // prompt string
