@@ -48,4 +48,3 @@ char *decode_piece(Tokenizer *t, int prev_token, int token);
 void safe_printf(const char *s);
 
 #endif // TOKENIZER_H
-

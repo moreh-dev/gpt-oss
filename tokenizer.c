@@ -316,4 +316,3 @@ void safe_printf(const char *s) {
     return;
   fputs(s, stdout);
 }
-
