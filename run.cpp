@@ -121,33 +121,33 @@ typedef struct {
 void malloc_run_state(RunState *s, Config *p) {
   // we calloc instead of malloc to keep valgrind happy
   int kv_dim = p->head_dim * p->n_kv_heads;
-  s->x = calloc(p->hidden_dim, sizeof(float));
-  s->t = calloc(p->hidden_dim, sizeof(float));
-  s->tb = calloc(p->head_dim * p->n_attn_heads, sizeof(float));
-  s->tb2 = calloc(p->hidden_dim, sizeof(float));
+  s->x = reinterpret_cast<float*>(calloc(p->hidden_dim, sizeof(float)));
+  s->t = reinterpret_cast<float*>(calloc(p->hidden_dim, sizeof(float)));
+  s->tb = reinterpret_cast<float*>(calloc(p->head_dim * p->n_attn_heads, sizeof(float)));
+  s->tb2 = reinterpret_cast<float*>(calloc(p->hidden_dim, sizeof(float)));
 
-  s->router_score = calloc(p->n_experts, sizeof(float));
-  s->topk_v = calloc(p->experts_per_token, sizeof(float));
-  s->topk_i = calloc(p->experts_per_token, sizeof(int));
+  s->router_score = reinterpret_cast<float*>(calloc(p->n_experts, sizeof(float)));
+  s->topk_v = reinterpret_cast<float*>(calloc(p->experts_per_token, sizeof(float)));
+  s->topk_i = reinterpret_cast<int*>(calloc(p->experts_per_token, sizeof(int)));
 
-  s->mlp1_out = calloc(2 * p->intermediate_dim, sizeof(float));
-  s->gate = calloc(p->intermediate_dim, sizeof(float));
-  s->up = calloc(p->intermediate_dim, sizeof(float));
-  s->gate_up = calloc(p->intermediate_dim, sizeof(float));
-  s->e_agg = calloc(p->hidden_dim, sizeof(float));
+  s->mlp1_out = reinterpret_cast<float*>(calloc(2 * p->intermediate_dim, sizeof(float)));
+  s->gate = reinterpret_cast<float*>(calloc(p->intermediate_dim, sizeof(float)));
+  s->up = reinterpret_cast<float*>(calloc(p->intermediate_dim, sizeof(float)));
+  s->gate_up = reinterpret_cast<float*>(calloc(p->intermediate_dim, sizeof(float)));
+  s->e_agg = reinterpret_cast<float*>(calloc(p->hidden_dim, sizeof(float)));
 
-  s->qkv = calloc(p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads),
-                  sizeof(float));
-  s->q = calloc(p->n_attn_heads * p->head_dim, sizeof(float));
-  s->k = calloc(p->n_kv_heads * p->head_dim, sizeof(float));
-  s->v = calloc(p->n_kv_heads * p->head_dim, sizeof(float));
+  s->qkv = reinterpret_cast<float*>(calloc(p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads),
+                  sizeof(float)));
+  s->q = reinterpret_cast<float*>(calloc(p->n_attn_heads * p->head_dim, sizeof(float)));
+  s->k = reinterpret_cast<float*>(calloc(p->n_kv_heads * p->head_dim, sizeof(float)));
+  s->v = reinterpret_cast<float*>(calloc(p->n_kv_heads * p->head_dim, sizeof(float)));
 
-  s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->att = calloc(p->n_attn_heads * p->seq_len, sizeof(float));
-  s->logits = calloc(p->vocab_size, sizeof(float));
+  s->key_cache = reinterpret_cast<float*>(calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
+  s->value_cache = reinterpret_cast<float*>(calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
+  s->att = reinterpret_cast<float*>(calloc(p->n_attn_heads * p->seq_len, sizeof(float)));
+  s->logits = reinterpret_cast<float*>(calloc(p->vocab_size, sizeof(float)));
   s->mask = p->sliding_window > 0
-                ? calloc(p->seq_len * p->seq_len, sizeof(float))
+                ? reinterpret_cast<float*>(calloc(p->seq_len * p->seq_len, sizeof(float)))
                 : NULL;
 
   // ensure all mallocs went fine
@@ -278,7 +278,7 @@ void load_checkpoint(char *ckpt, Config *config, TransformerWeights *weights,
     fprintf(stderr, "open failed\n");
     exit(EXIT_FAILURE);
   }
-  *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+  *data = reinterpret_cast<float*>(mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0));
   if (*data == MAP_FAILED) {
     fprintf(stderr, "mmap failed!\n");
     exit(EXIT_FAILURE);
@@ -390,7 +390,7 @@ void topk(float *topk_values, int *topk_indices, float *router_score,
     return;
   }
   // Allocate temp array to store (value, index) pairs
-  Pair *pairs = malloc(num_experts * sizeof(Pair));
+  Pair *pairs = reinterpret_cast<Pair*>(malloc(num_experts * sizeof(Pair)));
   if (!pairs) {
     fprintf(stderr, "Memory allocation failed for pairs\n");
     return;
@@ -573,8 +573,8 @@ float *forward(Transformer *transformer, int token, int pos) {
     // RoPE with YaRN scaling adapted from Python code
     float ntk_beta = 32.0f;
     float ntk_alpha = 1.0f;
-    float *cos_vals = malloc((head_dim / 2) * sizeof(float));
-    float *sin_vals = malloc((head_dim / 2) * sizeof(float));
+    float *cos_vals = reinterpret_cast<float*>(malloc((head_dim / 2) * sizeof(float)));
+    float *sin_vals = reinterpret_cast<float*>(malloc((head_dim / 2) * sizeof(float)));
     compute_cos_sin(pos, p->rope_theta, head_dim, p->rope_scaling_factor,
                     p->initial_context_length, ntk_beta, ntk_alpha, cos_vals,
                     sin_vals);
@@ -852,7 +852,7 @@ void build_sampler(Sampler *sampler, int vocab_size, float temperature,
   sampler->topp = topp;
   sampler->rng_state = rng_seed;
   // buffer only used with nucleus sampling; may not need but it's ~small
-  sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+  sampler->probindex = reinterpret_cast<ProbIndex*>(malloc(sampler->vocab_size * sizeof(ProbIndex)));
 }
 
 void free_sampler(Sampler *sampler) { free(sampler->probindex); }
@@ -910,8 +910,8 @@ long time_in_ms() {
 // generation loop
 
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-              char *prompt, int steps) {
-  char *empty_prompt = "";
+              const char *prompt, int steps) {
+  const char *empty_prompt = "";
   if (prompt == NULL) {
     prompt = empty_prompt;
   }
@@ -956,7 +956,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     }
 
     // print the token as string, decode it with the Tokenizer object
-    char *piece = decode_piece(tokenizer, token, next);
+    const char *piece = decode_piece(tokenizer, token, next);
     safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
     fflush(stdout);
     token = next;
@@ -998,7 +998,7 @@ void error_usage() {
   fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
   fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
   fprintf(stderr, "Options:\n");
-  fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
+  fprintf(stderr, "  -t <float>  temperature in [0,inf], default 0.0\n");
   fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] "
                   "default 0.9\n");
   fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
@@ -1014,15 +1014,13 @@ void error_usage() {
 int main(int argc, char **argv) {
   // default parameters
   char *checkpoint_path = NULL; // e.g. out/model.bin
-  char *tokenizer_path = "tokenizer.bin";
-  float temperature =
-      1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-  float topp =
-      0.9f; // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+  const char *tokenizer_path = "tokenizer.bin";
+  float temperature = 0.0f;        // 0.0 = greedy deterministic. 1.0 = original. don't set higher
+  float topp = 0.9f;               // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
   int steps = 256;                 // number of steps to run for
   char *prompt = NULL;             // prompt string
   unsigned long long rng_seed = 0; // seed rng with time by default
-  char *mode = "generate";         // generate|chat
+  const char *mode = "generate";         // generate|chat
   char *system_prompt =
       NULL; // the (optional) system prompt to use in chat mode
 

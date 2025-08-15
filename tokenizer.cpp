@@ -288,7 +288,7 @@ void encode(Tokenizer *t, const char *text, int bos_id, int eos_id, int *out,
   *n_out = ntok;
 }
 
-char *decode_piece(Tokenizer *t, int prev_token, int token) {
+const char *decode_piece(Tokenizer *t, int prev_token, int token) {
   (void)prev_token;
   if (token < 0 || token >= t->vocab_size)
     return "";

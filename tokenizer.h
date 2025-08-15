@@ -44,7 +44,7 @@ int encode_with_simple_splits(Tokenizer *t, const unsigned char *bytes, int len,
                               int *out, int out_cap);
 void encode(Tokenizer *t, const char *text, int bos_id, int eos_id, int *out,
             int *n_out, int max_tokens);
-char *decode_piece(Tokenizer *t, int prev_token, int token);
+const char *decode_piece(Tokenizer *t, int prev_token, int token);
 void safe_printf(const char *s);
 
 #endif // TOKENIZER_H
