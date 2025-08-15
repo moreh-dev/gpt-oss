@@ -149,7 +149,7 @@ void malloc_run_state(RunState *s, Config *p) {
 	// initialize mask
     for (int i = 0; i < p->seq_len; i++) {
         for (int j = 0; j < p->seq_len; j++) {
-            if (p->sliding_window > 0 && i - j >= p->sliding_window) {
+            if ((p->sliding_window > 0 && i - j >= p->sliding_window) || j - i >= 1) {
                 s->mask[i * p->seq_len + j] = -INFINITY; // Sliding window mask
             }
         }
@@ -950,7 +950,7 @@ int main(int argc, char **argv) {
     // default parameters
     char *checkpoint_path = NULL;  // e.g. out/model.bin
     char *tokenizer_path = "tokenizer.bin";
-    float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
+    float temperature = 0.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     int steps = 256;            // number of steps to run for
     char *prompt = NULL;        // prompt string

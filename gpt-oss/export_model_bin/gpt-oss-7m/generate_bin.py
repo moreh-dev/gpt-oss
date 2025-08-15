@@ -4,9 +4,11 @@ import struct
 import json
 import re
 import torch
+import argparse
 import numpy as np
 from safetensors.torch import load_file
 from collections import OrderedDict
+from itertools import islice
 
 # Explicit list to ensure correct keys order
 KEYS = [
@@ -20,10 +22,11 @@ KEYS = [
 		"num_attention_heads", 
 		"num_key_value_heads", 
 		"max_seq_len",
-		#"initial_context_length", 
-		#"rope_theta", 
-		#"sliding_window", 
-		#"swiglu_limit"
+		"initial_context_length", 
+		"rope_theta", 
+		"rope_scaling_factor",
+		"sliding_window", 
+		"swiglu_limit"
 ]
 
 CATEGORIES = [
@@ -78,7 +81,8 @@ def binarize_weights(state_dict, dtype="float32"):
 
 	reordered = OrderedDict()
 	for cat in CATEGORIES:
-		for _, key in buckets[cat]:
+		sorted_bucket = sorted(buckets[cat], key=lambda x: x[0])
+		for _, key in sorted_bucket:
 			reordered[key] = state_dict[key]
 	for key in sorted(others):
 		reordered[key] = state_dict[key]
@@ -90,17 +94,31 @@ def binarize_weights(state_dict, dtype="float32"):
 	for name, tensor in reordered.items():
 		np_tensor = tensor.detach().cpu().to(torch_dtype).numpy().astype(np_dtype)
 		weights_bin += np_tensor.tobytes()
+		print(f"Binarized {name}")
 
 	return weights_bin
 
+def parseCLIArgs():
+	parser = argparse.ArgumentParser()
+	parser.add_argument("-c", "--config", type=str, help="Path to config.json file")
+	parser.add_argument("-i", "--input", type=str, help="Path to input .safetensors file")
+	parser.add_argument("-o", "--output", type=str, help="Path to output .bin file")
+
+	args = parser.parse_args()
+	return args
 
 if __name__ == "__main__":
+	args = parseCLIArgs()
+	cfg = args.config
+	inp = args.input
+	out = args.output
 	with open("config.json", "r") as f:
-		config = json.load(f)
+		config_json = json.load(f)
 
-	config_bin = binarize_config(config)
+	config_bin = binarize_config(config_json)
 
-	state_dict = load_file("model.safetensors")
+	state_dict = load_file(inp)
 	weights_bin = binarize_weights(state_dict)
-	with open("gpt-oss-7M.bin", "wb") as f:
+	print("Writing to file ...")
+	with open(out, "wb") as f:
 		f.write(config_bin + weights_bin)

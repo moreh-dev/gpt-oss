@@ -1,5 +1,6 @@
 import os
 import torch
+import argparse
 from collections import OrderedDict
 from safetensors.torch import safe_open, load_file, save_file
 
@@ -74,29 +75,39 @@ def add_unembedding(state_dict):
 
 	return new_state_dict
 
+def parseCLIArgs():
+	parser = argparse.ArgumentParser()
+	parser.add_argument("-i", "--input", type=str, help="Path to original .safetensors file")
+
+	args = parser.parse_args()
+	return args
+
 if __name__ == "__main__":
-	path = "original_safetensors"
+	args = parseCLIArgs()
+	inp = args.input
 	# print keys
-	with safe_open(path, framework="pt", device="cpu") as f:
+	with safe_open(inp, framework="pt", device="cpu") as f:
 		keys = f.keys()
-		print("Keys in original_safetensors:")
+		print(f"Keys in original {inp}:")
 		for key in keys:
 			print(f"key: {key}, {f.get_tensor(key).shape}")
 	# convert keys
-	original_ckpt = load_file(path)
-	converted_ckpt = convert_keys(original_ckpt)
+	original_ckpt = load_file(inp)
 
+	converted_ckpt = convert_keys(original_ckpt)
+	# Rename the original weights
+	os.rename(inp, "original_safetensors")
 	concat_ckpt = concat_qkv(converted_ckpt, 0)
 	concat_ckpt = concat_qkv(concat_ckpt, 1)
 	reshape_ckpt = reshape_mlp(concat_ckpt, 0)
 	reshape_ckpt = reshape_mlp(reshape_ckpt, 1)
 	final_ckpt = add_unembedding(reshape_ckpt)
-	mod_path = "model.safetensors"
-	save_file(final_ckpt, mod_path)
+	# save under the name model.safetensors
+	save_file(final_ckpt, "model.safetensors")
 
-	with safe_open(mod_path, framework="pt", device="cpu") as f:
+	with safe_open("model.safetensors", framework="pt", device="cpu") as f:
 		keys = f.keys()
-		print("Keys in model.safetensors:")
+		print("Keys in modified model.safetensors:")
 		for key in keys:
 			print(f"key: {key}, {f.get_tensor(key).shape}")
 

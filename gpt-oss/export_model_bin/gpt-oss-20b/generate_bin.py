@@ -7,6 +7,7 @@ import torch
 import numpy as np
 from safetensors.torch import load_file
 from collections import OrderedDict
+from itertools import islice
 
 # Explicit list to ensure correct keys order
 KEYS = [
@@ -96,15 +97,27 @@ def binarize_weights(state_dict, dtype="float32"):
 
 	return weights_bin
 
+def parseCLIArgs():
+	parser = argparse.ArgumentParser()
+	parser.add_argument("-c", "--config", type=str, help="Path to config.json file")
+	parser.add_argument("-i", "--input", type=str, help="Path to input .safetensors file")
+	parser.add_argument("-o", "--output", type=str, help="Path to output .bin file")
 
+	args = parser.parse_args()
+	return args
+	
 if __name__ == "__main__":
+	args = parseCLIArgs()
+	cfg = args.config
+	inp = args.input
+	out = args.output
 	with open("config.json", "r") as f:
-		config = json.load(f)
+		config_json = json.load(f)
 
-	config_bin = binarize_config(config)
+	config_bin = binarize_config(config_json)
 
-	state_dict = load_file("model.safetensors")
+	state_dict = load_file(inp)
 	weights_bin = binarize_weights(state_dict)
 	print("Writing to file ...")
-	with open("gpt-oss-20B.bin", "wb") as f:
+	with open(out, "wb") as f:
 		f.write(config_bin + weights_bin)
