@@ -1,8 +1,7 @@
 # Commands
 ---
 ## Building
-- Build 
----
+- Build the model
 ```bash
 make run
 ```
