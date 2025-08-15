@@ -166,8 +166,8 @@ void free_run_state(RunState* s) {
 
 	free(s->qkv);
     free(s->q); 
-    //free(s->k);
-    //free(s->v);
+    free(s->k);
+    free(s->v);
 
     free(s->att);
     free(s->logits);
@@ -181,39 +181,39 @@ void memory_map_weights(TransformerWeights *w, Config *cfg, float *ptr) {
 	int n_layers = cfg->n_layers;
 	int n_experts = cfg->n_experts;
 	w->token_embedding_table = ptr;
-	ptr += cfg->vocab_size * cfg->hidden_dim;
+	ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
 	w->out = ptr; // unembedding
-	ptr += cfg->vocab_size * cfg->hidden_dim;
+	ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
 	w->rms_attn_w = ptr;
-	ptr += n_layers * cfg->hidden_dim;
+	ptr += 1ll * n_layers * cfg->hidden_dim;
 	w->rms_ffn_w = ptr;
-	ptr += n_layers * cfg->hidden_dim;
+	ptr += 1ll * n_layers * cfg->hidden_dim;
 	w->rms_out_w = ptr;
-	ptr += cfg->hidden_dim;
+	ptr += 1ll * cfg->hidden_dim;
 	// hey it's qkvqkv, not qqkkvv
 	w->w_qkv = ptr;
-	ptr += n_layers * cfg->hidden_dim * (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
+	ptr += 1ll * n_layers * cfg->hidden_dim * (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
 	w->b_qkv = ptr;
-	ptr += n_layers * (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
+	ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
 	w->w_o = ptr;
-	ptr += n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
+	ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
 	w->b_o = ptr;
-	ptr += n_layers * cfg->hidden_dim;
+	ptr += 1ll * n_layers * cfg->hidden_dim;
 	w->attn_sinks = ptr;
-	ptr += n_layers * cfg->n_attn_heads;
+	ptr += 1ll * n_layers * cfg->n_attn_heads;
 	w->w_router = ptr;
-	ptr += n_layers * cfg->hidden_dim * n_experts;
+	ptr += 1ll * n_layers * cfg->hidden_dim * n_experts;
 	w->b_router = ptr;
-	ptr += n_layers * n_experts;
+	ptr += 1ll * n_layers * n_experts;
 	// hey it's gate_upgate_up, not gategateupup
 	w->w_mlp1 = ptr;
-	ptr += n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim;
+	ptr += 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim;
 	w->b_mlp1 = ptr;
-	ptr += n_layers * n_experts * 2 * cfg->intermediate_dim;
+	ptr += 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim;
 	w->w_mlp2 = ptr;
-	ptr += n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim;
+	ptr += 1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim;
 	w->b_mlp2 = ptr;
-	ptr += n_layers * n_experts * cfg->hidden_dim;
+	ptr += 1ll * n_layers * n_experts * cfg->hidden_dim;
 }
 
 void load_checkpoint(char* ckpt, Config *config, TransformerWeights *weights, int *fd, float **data, ssize_t *file_size) {
@@ -271,7 +271,7 @@ void free_transformer(Transformer* t) {
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
-    float ss = 0.0f;
+    double ss = 0.0f;
     for (int j = 0; j < size; j++) {
         ss += x[j] * x[j];
     }
@@ -286,14 +286,14 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
 
 void softmax(float* x, int size) {
     // find max value (for numerical stability)
-    float max_val = x[0];
+    double max_val = x[0];
     for (int i = 1; i < size; i++) {
         if (x[i] > max_val) {
             max_val = x[i];
         }
     }
     // exp and sum
-    float sum = 0.0f;
+    double sum = 0.0f;
     for (int i = 0; i < size; i++) {
         x[i] = expf(x[i] - max_val);
         sum += x[i];
@@ -311,9 +311,9 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
-        float val = 0.0f;
+        double val = 0.0f;
         for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
+            val += w[1ll * i * n + j] * x[j];
         }
         xout[i] = val;
     }
@@ -385,7 +385,7 @@ float* forward(Transformer *transformer, int token, int pos) {
 	// forward all the layers
 	for (unsigned long long l = 0; l < p->n_layers; l++) {
 		// s->t (hidden_dim, )
-		rmsnorm(s->t, x, w->rms_attn_w + l*hidden_dim, hidden_dim);
+		rmsnorm(s->t, x, w->rms_attn_w + 1ll * l*hidden_dim, hidden_dim);
 
         // key and value point to the kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -393,8 +393,8 @@ float* forward(Transformer *transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;
 
 		// s->qkv = w->w_qkv * s->t = (head_dim * (n_attn_heads + 2 * n_kv_heads), hidden_dim) * (hidden_dim, ) = head_dim * (n_attn_heads + 2 * n_kv_heads)
-		float *w_qkv = w->w_qkv + l * hidden_dim * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
-		float *b_qkv = w->b_qkv + l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+		float *w_qkv = w->w_qkv + 1ll * l * hidden_dim * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+		float *b_qkv = w->b_qkv + 1ll * l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
 		matmul(s->qkv, s->t, w_qkv, hidden_dim, (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim);
 		// add bias
 		for (int i = 0; i < (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim; ++i) {
@@ -458,7 +458,7 @@ float* forward(Transformer *transformer, int token, int pos) {
 				// GQA
                 float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
                 // calculate the attention score as the dot product of q and k
-                float score = 0.0f;
+                double score = 0.0f;
                 for (int i = 0; i < head_dim; i++) {
                     score += q[i] * k[i];
                 }
@@ -491,8 +491,8 @@ float* forward(Transformer *transformer, int token, int pos) {
             }
         }
         // final matmul to get the output of the attention
-		float *w_o = w->w_o + l * (head_dim * p->n_attn_heads) * hidden_dim;
-		float *b_o = w->b_o + l * hidden_dim;
+		float *w_o = w->w_o + 1ll * l * (head_dim * p->n_attn_heads) * hidden_dim;
+		float *b_o = w->b_o + 1ll * l * hidden_dim;
         matmul(s->tb2, s->tb, w_o, head_dim * p->n_attn_heads, hidden_dim);
 		// add bias b_o
 		for (int i = 0; i < hidden_dim; i++) {
@@ -505,12 +505,12 @@ float* forward(Transformer *transformer, int token, int pos) {
         }
 
         // ffn rmsnorm
-        rmsnorm(s->t, x, w->rms_ffn_w + l * hidden_dim, hidden_dim);
+        rmsnorm(s->t, x, w->rms_ffn_w + 1ll * l * hidden_dim, hidden_dim);
 
 		// MoE
 		// Compute router_score
-		float *w_router = w->w_router + l * hidden_dim * n_experts;
-		float *b_router = w->b_router + l * n_experts;
+		float *w_router = w->w_router + 1ll * l * hidden_dim * n_experts;
+		float *b_router = w->b_router + 1ll * l * n_experts;
 		matmul(s->router_score, s->t, w_router, hidden_dim, n_experts); // s->router_score now stores router_score (n_experts, )
 		// add bias b_router
 		for (int i = 0; i < n_experts ; i++) {
@@ -536,8 +536,8 @@ float* forward(Transformer *transformer, int token, int pos) {
 			}
 
 			if (in_topk) {
-				float *w_mlp1 = w->w_mlp1 + ((l * n_experts + e) * (2 * p->intermediate_dim) * hidden_dim);
-				float *b_mlp1 = w->b_mlp1 + ((l * n_experts + e) * (2 * p->intermediate_dim));
+				float *w_mlp1 = w->w_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim) * hidden_dim;
+				float *b_mlp1 = w->b_mlp1 + 1ll * (l * n_experts + e) * (2 * p->intermediate_dim);
 				matmul(s->mlp1_out, s->t, w_mlp1, hidden_dim, 2 * p->intermediate_dim); // (2 * intermediate_dim, )
 				for (int i = 0; i < 2 * p->intermediate_dim; i++) {
 					s->mlp1_out[i] += b_mlp1[i];
@@ -556,6 +556,7 @@ float* forward(Transformer *transformer, int token, int pos) {
 					// Clamping
 					if (val > p->swiglu_limit) val = p->swiglu_limit;
 					if (up_val > p->swiglu_limit) up_val = p->swiglu_limit;
+					if (up_val < - p->swiglu_limit) up_val = -p->swiglu_limit;
 					// silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
 					val *= (1.0f / (1.0f + expf(-alpha * val)));
 					// elementwise multiply with w_gate(x)
@@ -564,8 +565,8 @@ float* forward(Transformer *transformer, int token, int pos) {
 				}
 				
 				// final matmul to get the output of the ffn
-				float *w_mlp2 = w->w_mlp2 + (l * n_experts + e) * hidden_dim * p->intermediate_dim; // (out: hidden_dim, in: intermediate_dim)
-				float *b_mlp2 = w->b_mlp2 + (l * n_experts + e) * hidden_dim;
+				float *w_mlp2 = w->w_mlp2 + 1ll * (l * n_experts + e) * hidden_dim * p->intermediate_dim; // (out: hidden_dim, in: intermediate_dim)
+				float *b_mlp2 = w->b_mlp2 + 1ll * (l * n_experts + e) * hidden_dim;
 				matmul(s->tb2, s->gate_up, w_mlp2, p->intermediate_dim, hidden_dim); // (hidden_dim, )
 				for (int i = 0; i < hidden_dim; i++) {
 					s->tb2[i] += b_mlp2[i];
@@ -783,6 +784,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
             // otherwise sample the next token from the logits
             next = sample(sampler, logits);
         }
+		printf("%d\n", next);
         pos++;
 
         // data-dependent terminating condition: the BOS (=1) token delimits sequences
@@ -790,7 +792,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
         // print the token as string, decode it with the Tokenizer object
         char* piece = decode_piece(tokenizer, token, next);
-        safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+        //safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
         fflush(stdout);
         token = next;
 
