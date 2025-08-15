@@ -146,6 +146,14 @@ void malloc_run_state(RunState *s, Config *p) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
+	// initialize mask
+    for (int i = 0; i < p->seq_len; i++) {
+        for (int j = 0; j < p->seq_len; j++) {
+            if (p->sliding_window > 0 && i - j >= p->sliding_window) {
+                s->mask[i * p->seq_len + j] = -INFINITY; // Sliding window mask
+            }
+        }
+    }
 }
 
 void free_run_state(RunState* s) {
@@ -365,6 +373,120 @@ void topk(float* topk_values, int* topk_indices, float* router_score, int num_ex
     free(pairs);
 }
 
+void compute_concentration_and_inv_freq(
+    float base,
+    int head_dim,
+    float scaling_factor,
+    float initial_context_length,
+    float ntk_beta,
+    float ntk_alpha,
+    float *concentration_out,
+    float *inv_freq_out // length head_dim/2
+) {
+    int d_half = head_dim / 2;
+
+    // freq[i] = base ** (i / head_dim)
+    float *freq = (float *)malloc(d_half * sizeof(float));
+    for (int i = 0; i < d_half; i++) {
+        freq[i] = powf(base, ((float)(2 * i)) / (float)head_dim);
+    }
+
+    float concentration;
+    if (scaling_factor > 1.0f) {
+        // YaRN concentration
+        concentration = 0.1f * logf(scaling_factor) + 1.0f;
+
+        // NTK by parts
+        float low = d_half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI))
+                    / logf(base);
+        float high = d_half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI))
+                     / logf(base);
+
+        assert(0 < low && low < high && high < d_half - 1);
+
+        // interpolation = 1 / (scaling_factor * freq)
+        // extrapolation = 1 / freq
+        for (int i = 0; i < d_half; i++) {
+            float interpolation = 1.0f / (scaling_factor * freq[i]);
+            float extrapolation = 1.0f / freq[i];
+
+            float ramp = ((float)i - low) / (high - low);
+            if (ramp < 0) ramp = 0;
+            if (ramp > 1) ramp = 1;
+
+            float mask = 1.0f - ramp;
+            inv_freq_out[i] = interpolation * (1.0f - mask) + extrapolation * mask;
+        }
+    } else {
+        concentration = 1.0f;
+        for (int i = 0; i < d_half; i++) {
+            inv_freq_out[i] = 1.0f / freq[i];
+        }
+    }
+
+    *concentration_out = concentration;
+
+    free(freq);
+}
+
+void compute_cos_sin(
+    int pos,                 // position index
+    float base,
+    int head_dim,
+    float scaling_factor,
+    float initial_context_length,
+    float ntk_beta,
+    float ntk_alpha,
+    float *cos_out,          // shape: head_dim/2
+    float *sin_out           // shape: head_dim/2
+) {
+    int d_half = head_dim / 2;
+
+    // Get concentration + inv_freq
+    float concentration;
+    float *inv_freq = (float *)malloc(d_half * sizeof(float));
+
+    compute_concentration_and_inv_freq(
+        base, head_dim, scaling_factor,
+        initial_context_length, ntk_beta, ntk_alpha,
+        &concentration, inv_freq
+    );
+
+    // Compute cos and sin for this position
+    for (int j = 0; j < d_half; j++) {
+        float val = (float)pos * inv_freq[j];
+        cos_out[j] = cosf(val) * concentration;
+        sin_out[j] = sinf(val) * concentration;
+    }
+
+    free(inv_freq);
+}
+
+void apply_rotary_emb(
+    float *x, float *cos, float *sin,
+    int n_heads, int head_dim
+) {
+    int half = head_dim / 2;
+
+    for (int h = 0; h < n_heads; h++) {
+        for (int i = 0; i < half; i++) {
+            // Indexing: head h, dim i
+            float x1 = x[h * head_dim + i];       // first half
+            float x2 = x[h * head_dim + half + i]; // second half
+
+            float c = cos[i];
+            float s = sin[i];
+
+            float o1 = x1 * c - x2 * s;
+            float o2 = x2 * c + x1 * s;
+
+            x[h * head_dim + i]       = o1;
+            x[h * head_dim + half + i] = o2;
+        }
+    }
+}
+
+
 float* forward(Transformer *transformer, int token, int pos) {
 	Config *p = &transformer->config;
 	TransformerWeights *w = &transformer->weights;
@@ -407,42 +529,27 @@ float* forward(Transformer *transformer, int token, int pos) {
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
 		// Adapted from https://github.com/openai/gpt-oss/blob/main/gpt_oss/torch/model.py#L85
-        for (int i = 0; i < head_dim * p->n_attn_heads; i+=2) {
-			float concentration = 1.0f;
-            int pair_idx_in_head = i % head_dim;
-			float freq = powf(p->rope_theta, pair_idx_in_head / (float)head_dim);
-            float inv_freq = 1.0f / freq;;
-			if (p->rope_scaling_factor > 1.0f) {
-				float ntk_alpha = 1.0f;
-				float ntk_beta = 32.0f;
-				concentration = 0.1f * log(p->rope_scaling_factor) + 1.0f;
-				int d_half = head_dim / 2;
-				// NTK by parts
-				float low = (d_half * log(p->initial_context_length) / (ntk_beta * 2 * M_PI)) / log(p->rope_theta);
-				float high = (d_half * log(p->initial_context_length) / (ntk_alpha * 2 * M_PI)) / log(p->rope_theta);
-				assert(0 < low && low < high && high < d_half - 1);
-				float interpolation = 1.0f / (p->rope_scaling_factor * p->rope_theta);
-				float extrapolation = 1.0f / freq;
-				float r = 0.0f;
-				float ramp = (r - low) / (high - low);
-				if (ramp > 1) { ramp = 1; }
-				if (ramp < 0) { ramp = 0; }
-				float mask = 1 - ramp;
-				inv_freq = interpolation * (1 - mask) + extrapolation * mask;
-				r++;
-			}
-            float val = pos * inv_freq;
-            float fcr = cosf(val) * concentration;
-            float fci = sinf(val) * concentration;
-            int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-            for (int v = 0; v < rotn; v++) {
-                float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
-                float v0 = vec[i];
-                float v1 = vec[i+1];
-                vec[i]   = v0 * fcr - v1 * fci;
-                vec[i+1] = v0 * fci + v1 * fcr;
-            }
-        }
+		// RoPE with YaRN scaling adapted from Python code
+	    float ntk_beta = 32.0f;
+ 	  	float ntk_alpha = 1.0f;
+		float *cos_vals = malloc((head_dim / 2) * sizeof(float));
+		float *sin_vals = malloc((head_dim / 2) * sizeof(float));
+		compute_cos_sin(
+			pos,
+			p->rope_theta,
+			head_dim,
+			p->rope_scaling_factor,
+			p->initial_context_length,
+			ntk_beta,
+			ntk_alpha,
+			cos_vals,
+			sin_vals
+		);
+		apply_rotary_emb(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
+		apply_rotary_emb(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
+
+		free(cos_vals);
+		free(sin_vals);
 		
         // multihead attention. iterate over all heads
         int h;
@@ -464,7 +571,7 @@ float* forward(Transformer *transformer, int token, int pos) {
                 }
                 score /= sqrtf(head_dim);
 				// Apply sliding window mask if enabled
-				if (p->sliding_window > 0) {
+				if (p->sliding_window > 0 && (l % 2 == 0) ) {
 					score += s->mask[pos * p->seq_len + t];
 				}
                 // save the score to the attention buffer
@@ -556,7 +663,7 @@ float* forward(Transformer *transformer, int token, int pos) {
 					// Clamping
 					if (val > p->swiglu_limit) val = p->swiglu_limit;
 					if (up_val > p->swiglu_limit) up_val = p->swiglu_limit;
-					if (up_val < - p->swiglu_limit) up_val = -p->swiglu_limit;
+					if (up_val < -p->swiglu_limit) up_val = -p->swiglu_limit;
 					// silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
 					val *= (1.0f / (1.0f + expf(-alpha * val)));
 					// elementwise multiply with w_gate(x)
@@ -784,7 +891,6 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
             // otherwise sample the next token from the logits
             next = sample(sampler, logits);
         }
-		printf("%d\n", next);
         pos++;
 
         // data-dependent terminating condition: the BOS (=1) token delimits sequences
@@ -792,7 +898,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
         // print the token as string, decode it with the Tokenizer object
         char* piece = decode_piece(tokenizer, token, next);
-        //safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+        safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
         fflush(stdout);
         token = next;
 
