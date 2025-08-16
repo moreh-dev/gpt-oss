@@ -122,7 +122,8 @@ void getp(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
   start = time_in_ms();
   warm_up(transformer, tokenizer);
   end = time_in_ms();
-  printf("warm up elapsed time(s): %f\n\n", (double)(end - start) / 1000);
+  printf("\nwarm up elapsed time(s): %f\n", (double)(end - start) / 1000);
+  fflush(stdout);
 
   start = time_in_ms();
   long long num_gen_tokens =
@@ -130,9 +131,10 @@ void getp(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
   end = time_in_ms();
   // Your goal is to achieve best throughput(=reduce elapsed time)!
   fprintf(stdout,
-          "elapsed time(s): %f, achieved throughput TPS (tok/s): %f\n\n",
+          "\nelapsed time(s): %f, achieved throughput TPS (tok/s): %f\n",
           (double)(end - start) / 1000,
           (num_gen_tokens) / (double)(end - start) * 1000);
+  fflush(stdout);
 
   if (EXIT_FAILURE == write_outputfile(output_filename, &requests)) {
     fprintf(stderr, "cannot write output file: %s\n", output_filename);
@@ -142,7 +144,8 @@ void getp(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
   start = time_in_ms();
   finish(transformer, tokenizer);
   end = time_in_ms();
-  printf("finish elapsed time(s): %f\n\n", (double)(end - start) / 1000);
+  printf("\nfinish elapsed time(s): %f\n", (double)(end - start) / 1000);
+  fflush(stdout);
 
   free_requests(&requests);
 }
