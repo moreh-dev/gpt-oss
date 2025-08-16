@@ -15,42 +15,34 @@ rundebug: run.c
 	$(CC) -g -o runq runq.c -lm
 
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
-# https://simonbyrne.github.io/notes/fastmath/
-# -Ofast enables all -O3 optimizations.
-# Disregards strict standards compliance.
-# It also enables optimizations that are not valid for all standard-compliant programs.
-# It turns on -ffast-math, -fallow-store-data-races and the Fortran-specific
-# -fstack-arrays, unless -fmax-stack-var-size is specified, and -fno-protect-parens.
-# It turns off -fsemantic-interposition.
-# In our specific application this is *probably* okay to use
 .PHONY: runfast
-runfast: run.c
-	$(CC) -Ofast -o run run.c -lm
-	$(CC) -Ofast -o runq runq.c -lm
+runfast: run.c tokenizer.c
+	$(CC) -O3 -o run run.c tokenizer.c -lm
+	# $(CC) -O3 -o runq runq.c -lm
 
 # additionally compiles with OpenMP, allowing multithreaded runs
 # make sure to also enable multiple threads when running, e.g.:
 # OMP_NUM_THREADS=4 ./run out/model.bin
 .PHONY: runomp
-runomp: run.c
-	$(CC) -Ofast -fopenmp -march=native run.c  -lm  -o run
-	$(CC) -Ofast -fopenmp -march=native runq.c  -lm  -o runq
+runomp: run.c tokenizer.c
+	$(CC) -O3 -fopenmp -march=native run.c tokenizer.c -lm  -o run
+	# $(CC) -O3 -fopenmp -march=native runq.c  -lm  -o runq
 
 .PHONY: win64
 win64:
-	x86_64-w64-mingw32-gcc -Ofast -D_WIN32 -o run.exe -I. run.c win.c
-	x86_64-w64-mingw32-gcc -Ofast -D_WIN32 -o runq.exe -I. runq.c win.c
+	x86_64-w64-mingw32-gcc -O3 -D_WIN32 -o run.exe -I. run.c win.c
+	x86_64-w64-mingw32-gcc -O3 -D_WIN32 -o runq.exe -I. runq.c win.c
 
 # compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility
 .PHONY: rungnu
 rungnu:
-	$(CC) -Ofast -std=gnu11 -o run run.c -lm
-	$(CC) -Ofast -std=gnu11 -o runq runq.c -lm
+	$(CC) -O3 -std=gnu11 -o run run.c -lm
+	$(CC) -O3 -std=gnu11 -o runq runq.c -lm
 
 .PHONY: runompgnu
 runompgnu:
-	$(CC) -Ofast -fopenmp -std=gnu11 run.c  -lm  -o run
-	$(CC) -Ofast -fopenmp -std=gnu11 runq.c  -lm  -o runq
+	$(CC) -O3 -fopenmp -std=gnu11 run.c  -lm  -o run
+	$(CC) -O3 -fopenmp -std=gnu11 runq.c  -lm  -o runq
 
 # run all tests
 .PHONY: test
