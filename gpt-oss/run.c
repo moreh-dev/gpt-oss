@@ -99,6 +99,9 @@ typedef struct {
     // kv cache
     float *key_cache;   // (layer, seq_len, kv_dim)
     float *value_cache; // (layer, seq_len, kv_dim)
+
+	float *cos_vals;
+	float *sin_vals;
 	float *mask;
 } RunState;
 
@@ -138,11 +141,15 @@ void malloc_run_state(RunState *s, Config *p) {
     s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     s->att = calloc(p->n_attn_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
+
+	s->sin_vals = calloc((p->head_dim / 2), sizeof(float));
+	s->cos_vals = calloc((p->head_dim / 2), sizeof(float));
+
 	s->mask = p->sliding_window > 0 ? calloc(p->seq_len * p->seq_len, sizeof(float)) : NULL;
 
     // ensure all mallocs went fine
     if (!s->x || !s->t || !s->tb || !s->tb2 || !s->qkv || !s->q || !s->k || !s->v
-     || !s->key_cache || !s->value_cache || !s->att || !s->logits || (p->sliding_window > 0 && !s->mask) || !s->e_agg) {
+     || !s->key_cache || !s->value_cache || !s->att || !s->logits || (p->sliding_window > 0 && !s->mask) || !s->e_agg || !s->cos_vals || !s->sin_vals) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
@@ -181,6 +188,9 @@ void free_run_state(RunState* s) {
     free(s->logits);
     free(s->key_cache);
     free(s->value_cache);
+
+	free(s->cos_vals);
+	free(s->sin_vals);
 	if (s->mask) free(s->mask);
 }
 
@@ -279,7 +289,7 @@ void free_transformer(Transformer* t) {
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
-    double ss = 0.0f;
+    float ss = 0.0f;
     for (int j = 0; j < size; j++) {
         ss += x[j] * x[j];
     }
@@ -294,14 +304,14 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
 
 void softmax(float* x, int size) {
     // find max value (for numerical stability)
-    double max_val = x[0];
+    float max_val = x[0];
     for (int i = 1; i < size; i++) {
         if (x[i] > max_val) {
             max_val = x[i];
         }
     }
     // exp and sum
-    double sum = 0.0f;
+    float sum = 0.0f;
     for (int i = 0; i < size; i++) {
         x[i] = expf(x[i] - max_val);
         sum += x[i];
@@ -319,7 +329,7 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
-        double val = 0.0f;
+        float val = 0.0f;
         for (int j = 0; j < n; j++) {
             val += w[1ll * i * n + j] * x[j];
         }
@@ -532,8 +542,6 @@ float* forward(Transformer *transformer, int token, int pos) {
 		// RoPE with YaRN scaling adapted from Python code
 	    float ntk_beta = 32.0f;
  	  	float ntk_alpha = 1.0f;
-		float *cos_vals = malloc((head_dim / 2) * sizeof(float));
-		float *sin_vals = malloc((head_dim / 2) * sizeof(float));
 		compute_cos_sin(
 			pos,
 			p->rope_theta,
@@ -542,18 +550,16 @@ float* forward(Transformer *transformer, int token, int pos) {
 			p->initial_context_length,
 			ntk_beta,
 			ntk_alpha,
-			cos_vals,
-			sin_vals
+			s->cos_vals,
+			s->sin_vals
 		);
-		apply_rotary_emb(s->q, cos_vals, sin_vals, p->n_attn_heads, head_dim);
-		apply_rotary_emb(s->k, cos_vals, sin_vals, p->n_kv_heads, head_dim);
+		apply_rotary_emb(s->q, s->cos_vals, s->sin_vals, p->n_attn_heads, head_dim);
+		apply_rotary_emb(s->k, s->cos_vals, s->sin_vals, p->n_kv_heads, head_dim);
 
-		free(cos_vals);
-		free(sin_vals);
 		
         // multihead attention. iterate over all heads
         int h;
-        #pragma omp parallel for private(h)
+        #pragma omp parallel for private(h) 
         for (h = 0; h < p->n_attn_heads; h++) {
             // get the query vector for this head
             float* q = s->q + h * head_dim;
@@ -565,7 +571,7 @@ float* forward(Transformer *transformer, int token, int pos) {
 				// GQA
                 float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
                 // calculate the attention score as the dot product of q and k
-                double score = 0.0f;
+                float score = 0.0f;
                 for (int i = 0; i < head_dim; i++) {
                     score += q[i] * k[i];
                 }
@@ -578,7 +584,7 @@ float* forward(Transformer *transformer, int token, int pos) {
                 att[t] = score;
             }
 			// Add attention sink score
-			att[pos + 1] = w->attn_sinks[l * p->n_attn_heads + h];
+			att[pos + 2] = w->attn_sinks[l * p->n_attn_heads + h];
             // softmax the scores to get attention weights, from 0..pos inclusively
             softmax(att, pos + 2);
 
