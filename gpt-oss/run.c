@@ -134,8 +134,6 @@ void malloc_run_state(RunState *s, Config *p) {
 
     s->qkv = calloc(p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads), sizeof(float));
     s->q = calloc(p->n_attn_heads * p->head_dim, sizeof(float));
-    s->k = calloc(p->n_kv_heads * p->head_dim, sizeof(float));
-    s->v = calloc(p->n_kv_heads * p->head_dim, sizeof(float));
 
     s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
@@ -148,7 +146,7 @@ void malloc_run_state(RunState *s, Config *p) {
 	s->mask = p->sliding_window > 0 ? calloc(p->seq_len * p->seq_len, sizeof(float)) : NULL;
 
     // ensure all mallocs went fine
-    if (!s->x || !s->t || !s->tb || !s->tb2 || !s->qkv || !s->q || !s->k || !s->v
+    if (!s->x || !s->t || !s->tb || !s->tb2 || !s->qkv || !s->q
      || !s->key_cache || !s->value_cache || !s->att || !s->logits || (p->sliding_window > 0 && !s->mask) || !s->e_agg || !s->cos_vals || !s->sin_vals) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
@@ -181,8 +179,6 @@ void free_run_state(RunState* s) {
 
 	free(s->qkv);
     free(s->q); 
-    free(s->k);
-    free(s->v);
 
     free(s->att);
     free(s->logits);
@@ -584,7 +580,7 @@ float* forward(Transformer *transformer, int token, int pos) {
                 att[t] = score;
             }
 			// Add attention sink score
-			att[pos + 2] = w->attn_sinks[l * p->n_attn_heads + h];
+			att[pos + 1] = w->attn_sinks[l * p->n_attn_heads + h];
             // softmax the scores to get attention weights, from 0..pos inclusively
             softmax(att, pos + 2);
 
@@ -941,7 +937,7 @@ void error_usage() {
     fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
     fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
+    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 0.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
