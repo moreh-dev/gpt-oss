@@ -139,8 +139,6 @@ void malloc_run_state(RunState *s, Config *p) {
   s->qkv = reinterpret_cast<float*>(calloc(p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads),
                   sizeof(float)));
   s->q = reinterpret_cast<float*>(calloc(p->n_attn_heads * p->head_dim, sizeof(float)));
-  s->k = reinterpret_cast<float*>(calloc(p->n_kv_heads * p->head_dim, sizeof(float)));
-  s->v = reinterpret_cast<float*>(calloc(p->n_kv_heads * p->head_dim, sizeof(float)));
 
   s->key_cache = reinterpret_cast<float*>(calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
   s->value_cache = reinterpret_cast<float*>(calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float)));
@@ -151,8 +149,8 @@ void malloc_run_state(RunState *s, Config *p) {
                 : NULL;
 
   // ensure all mallocs went fine
-  if (!s->x || !s->t || !s->tb || !s->tb2 || !s->qkv || !s->q || !s->k ||
-      !s->v || !s->key_cache || !s->value_cache || !s->att || !s->logits ||
+  if (!s->x || !s->t || !s->tb || !s->tb2 || !s->qkv || !s->q ||
+      !s->key_cache || !s->value_cache || !s->att || !s->logits ||
       (p->sliding_window > 0 && !s->mask) || !s->e_agg) {
     fprintf(stderr, "malloc failed!\n");
     exit(EXIT_FAILURE);
@@ -185,8 +183,6 @@ void free_run_state(RunState *s) {
 
   free(s->qkv);
   free(s->q);
-  free(s->k);
-  free(s->v);
 
   free(s->att);
   free(s->logits);
