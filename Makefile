@@ -27,37 +27,6 @@ runfast: $(CPP_FILES)
 runomp: $(CPP_FILES)
 	$(CC) $(CFLAGS) --std=c++17 -O3 -fopenmp -march=native $(CPP_FILES) -o run
 
-.PHONY: win64
-win64: $(CPP_FILES)
-	x86_64-w64-mingw32-gcc $(CFLAGS) -O3 -D_WIN32 -o run.exe -I. $(CPP_FILES)
-
-# compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility
-.PHONY: rungnu
-rungnu: $(CPP_FILES)
-	$(CC) $(CFLAGS) -O3 -std=gnu11 -o run $(CPP_FILES)
-
-.PHONY: runompgnu
-runompgnu: $(CPP_FILES)
-	$(CC) $(CFLAGS) -O3 -fopenmp -std=gnu11 $(CPP_FILES) -o run
-
-# run all tests
-.PHONY: test
-test:
-	pytest
-
-# run only tests for run.cpp C implementation (is a bit faster if only C code changed)
-.PHONY: testc
-testc:
-	pytest -k runc
-
-# run the C tests, without touching pytest / python
-# to increase verbosity level run e.g. as `make testcc VERBOSITY=1`
-VERBOSITY ?= 0
-.PHONY: testcc
-testcc:
-	$(CC) $(CFLAGS) -DVERBOSITY=$(VERBOSITY) -O3 -o testc test.cpp
-	./testc
-
 .PHONY: clean
 clean:
 	rm -f run
