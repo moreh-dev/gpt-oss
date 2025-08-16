@@ -38,7 +38,7 @@ char *get_str_req_ptr(Requests *reqs, int idx) {
 }
 
 int *get_tok_gen_ptr(Requests *reqs, int idx) {
-  return reqs->tok_gens + idx * reqs->max_token_len * reqs->max_seq_len;
+  return reqs->tok_gens + idx * reqs->max_seq_len;
 }
 
 int read_inputfile(const char *input_filename, int max_token_len,
