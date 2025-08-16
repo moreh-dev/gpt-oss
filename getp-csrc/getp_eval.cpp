@@ -147,7 +147,7 @@ void getp(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
   printf("\nfinish elapsed time(s): %f\n", (double)(end - start) / 1000);
   fflush(stdout);
 
-  free_requests(&requests);
+  // free_requests(&requests);
 }
 
 #endif // GETP_EVAL
