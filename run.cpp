@@ -1118,13 +1118,12 @@ void error_usage() {
   fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
   fprintf(stderr, "  -n <int>    number of steps to run for, default 1024. 0 = "
                   "max_seq_len\n");
-  fprintf(stderr, "  -i <string> input prompt\n");
+  fprintf(stderr, "  -i <string> input file in getp mode or input prompt in other modes\n");
+  fprintf(stderr, "  -o <string> output file in getp mode\n");
   fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
   fprintf(stderr,
           "  -m <string> mode: generate|chat|getp, default: generate\n");
   fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
-  fprintf(stderr, "  -f <string> input file in getp mode\n");
-  fprintf(stderr, "  -o <string> output file in getp mode\n");
   exit(EXIT_FAILURE);
 }
 
@@ -1174,14 +1173,13 @@ int main(int argc, char **argv) {
       steps = atoi(argv[i + 1]);
     } else if (argv[i][1] == 'i') {
       prompt = argv[i + 1];
+      input_filename = argv[i + 1];
     } else if (argv[i][1] == 'z') {
       tokenizer_path = argv[i + 1];
     } else if (argv[i][1] == 'm') {
       mode = argv[i + 1];
     } else if (argv[i][1] == 'y') {
       system_prompt = argv[i + 1];
-    } else if (argv[i][1] == 'f') {
-      input_filename = argv[i + 1];
     } else if (argv[i][1] == 'o') {
       output_filename = argv[i + 1];
     } else {

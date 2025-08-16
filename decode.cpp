@@ -7,12 +7,12 @@
 
 void error_usage() {
   fprintf(stderr, "Usage:   decode [options]\n");
-  fprintf(stderr, "Example: decode -p 0 -i data/output_tokens.txt\n");
+  fprintf(stderr, "Example: decode -p 0 -i data/output.txt\n");
   fprintf(stderr, "Options:\n");
   fprintf(stderr, "  -p <int> (optional) line number to decode, default: -1 "
                   "for all lines\n");
   fprintf(stderr, "  -i <string> (optional) input tokens file, default: "
-                  "data/output_tokens.txt\n");
+                  "data/output.txt\n");
   fprintf(stderr, "  -z <string> (optional) optional path to custom tokenizer, "
                   "default: tokenizer.bin\n");
   exit(EXIT_FAILURE);
@@ -20,7 +20,7 @@ void error_usage() {
 
 int main(int argc, char **argv) {
   int line_to_decode = -1;
-  std::string input_path = "data/output_tokens.txt";
+  std::string input_path = "data/output.txt";
   std::string tokenizer_path = "tokenizer.bin";
   const int vocab_size = 201088;
 
