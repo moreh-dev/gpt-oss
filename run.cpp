@@ -1118,7 +1118,9 @@ void error_usage() {
   fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
   fprintf(stderr, "  -n <int>    number of steps to run for, default 1024. 0 = "
                   "max_seq_len\n");
-  fprintf(stderr, "  -i <string> input file in getp mode or input prompt in other modes\n");
+  fprintf(
+      stderr,
+      "  -i <string> input file in getp mode or input prompt in other modes\n");
   fprintf(stderr, "  -o <string> output file in getp mode\n");
   fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
   fprintf(stderr,
