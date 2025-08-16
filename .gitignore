@@ -26,3 +26,4 @@ build/
 *.safetensors
 *.bin
 run
+decode
