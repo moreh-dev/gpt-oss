@@ -27,6 +27,10 @@ runfast: $(CPP_FILES)
 runomp: $(CPP_FILES)
 	$(CC) $(CFLAGS) --std=c++17 -O3 -fopenmp -march=native $(CPP_FILES) -o run
 
+.PHONY: decode
+decode: decode.cpp tokenizer.cpp
+	$(CC) $(CFLAGS) --std=c++17 -O3 -fopenmp -march=native decode.cpp tokenizer.cpp -o decode
+
 .PHONY: clean
 clean:
-	rm -f run
+	rm -f run decode
