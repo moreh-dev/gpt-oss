@@ -1,6 +1,6 @@
 # Ignore files with no extension
 *
-!*/**
+!*/
 !*.*
 
 # Virtual env
