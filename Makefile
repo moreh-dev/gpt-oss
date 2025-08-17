@@ -1,7 +1,7 @@
-# choose your compiler, e.g. gcc/clang
-# example override to clang: make run CC=clang
-CC = hipcc
-CFLAGS = --offload-arch=gfx90a -lm
+# use hipcc as default
+# if hipcc isn't available, use g++
+CC := $(shell command -v hipcc 2>/dev/null || echo g++)
+CFLAGS = --std=c++17 --offload-arch=gfx90a -lm
 
 CPP_FILES = run.cpp tokenizer.cpp
 
@@ -13,23 +13,23 @@ run: $(CPP_FILES)
 # useful for a debug build, can then e.g. analyze with valgrind, example:
 # $ valgrind --leak-check=full ./run out/model.bin -n 3
 rundebug: $(CPP_FILES)
-	$(CC) $(CFLAGS) --std=c++17 -g -o run $(CPP_FILES)
+	$(CC) $(CFLAGS) -g -o run $(CPP_FILES)
 
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 .PHONY: runfast
 runfast: $(CPP_FILES)
-	$(CC) $(CFLAGS) --std=c++17 -O3 -o run $(CPP_FILES)
+	$(CC) $(CFLAGS) -O3 -o run $(CPP_FILES)
 
 # additionally compiles with OpenMP, allowing multithreaded runs
 # make sure to also enable multiple threads when running, e.g.:
 # OMP_NUM_THREADS=4 ./run out/model.bin
 .PHONY: runomp
 runomp: $(CPP_FILES)
-	$(CC) $(CFLAGS) --std=c++17 -O3 -fopenmp -march=native $(CPP_FILES) -o run
+	$(CC) $(CFLAGS) -O3 -fopenmp -march=native $(CPP_FILES) -o run
 
 .PHONY: decode
 decode: decode.cpp tokenizer.cpp
-	$(CC) $(CFLAGS) --std=c++17 -O3 -fopenmp -march=native decode.cpp tokenizer.cpp -o decode
+	$(CC) $(CFLAGS) -O3 decode.cpp tokenizer.cpp -o decode
 
 .PHONY: clean
 clean:
