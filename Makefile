@@ -40,8 +40,8 @@ tokenizer-bin: export_tokenizer_bin.py
 
 .PHONY: tokenizer-test
 tokenizer-test: test_tokenizer.cpp tokenizer.cpp tokenizer-bin
-	$(CC) $(CFLAGS) -DTESTING -O3 test_tokenizer.cpp tokenizer.cpp -o tokenizer-test
+	$(CC) $(CFLAGS) -DTESTING -O3 test_tokenizer.cpp tokenizer.cpp -o test_tokenizer
 
 .PHONY: clean
 clean:
-	rm -f run decode tokenizer.bin tokenizer-test
+	rm -f run decode tokenizer.bin test_tokenizer
