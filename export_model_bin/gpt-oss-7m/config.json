@@ -8,6 +8,7 @@
   "head_dim": 32,
   "num_attention_heads": 2,
   "num_key_value_heads": 1,
+  "max_seq_len": 256,
   "initial_context_length": 4096,
   "rope_theta": 150000,
   "sliding_window": 128,
