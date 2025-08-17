@@ -922,6 +922,14 @@ long time_in_ms() {
 
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
               const char *prompt, int steps) {
+  // <|start|>: 200006
+  // <|end|>: 200007
+  // <|return|>: 200002
+  // <|message|>: 200008
+  // <|channel|>: 200005
+  // <|constrain|>: 200003
+  // <|endoftext|>: 199999
+
   const char *empty_prompt = "";
   if (prompt == NULL) {
     prompt = empty_prompt;
