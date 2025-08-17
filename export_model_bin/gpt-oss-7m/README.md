@@ -1,6 +1,6 @@
-# Export GPT-OSS 7M Model
+# Export GPT-OSS 7m Model
 
-This directory contains scripts to prepare the **7M parameter GPT-OSS model** for use with the C++ runtime.
+This directory contains scripts to prepare the **7m parameter GPT-OSS model** for use with the C++ runtime.
 The process converts the Hugging Face checkpoint into a single `.bin` file that can be directly loaded.
 
 1. **Convert state dict**
@@ -8,7 +8,7 @@ The process converts the Hugging Face checkpoint into a single `.bin` file that 
 
 ```bash
 python "${GPT_OSS_REPO_ROOT}/export_model_bin/gpt-oss-7m/convert_state_dict.py" \
-  --input  "${MODELS_ROOT}/gpt-oss-7M/model.safetensors" \
+  --input  "${MODELS_ROOT}/gpt-oss-7m/model.safetensors" \
   --output "${GPT_OSS_REPO_ROOT}/export_model_bin/gpt-oss-7m/model.safetensors"
 ```
 

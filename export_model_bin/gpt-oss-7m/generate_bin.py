@@ -1,19 +1,8 @@
-"""
-generate_bin.py
----------------
-Wraps a converted checkpoint (safetensors) and its config.json
-into a single `.bin` file compatible with the GPT-OSS C++ runtime.
-
-Usage
------
-python generate_bin.py \
-  --config config.json \
-  --input  model.safetensors \
-  --output gpt-oss-7M.bin
-"""
+# Wrapping config and weights in to a .bin file
 
 import argparse
 from collections import OrderedDict
+from itertools import islice
 import json
 import re
 import struct
@@ -24,23 +13,15 @@ import torch
 
 # Explicit list to ensure correct keys order
 KEYS = [
-    "vocab_size",
-    "hidden_size",
-    "num_experts",
-    "experts_per_token",
-    "intermediate_size",
-    "num_hidden_layers",
-    "head_dim",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "max_seq_len",
-    # "initial_context_length",
-    # "rope_theta",
-    # "sliding_window",
-    # "swiglu_limit"
+    "vocab_size", "hidden_size", "num_experts", "experts_per_token",
+    "intermediate_size", "num_hidden_layers", "head_dim",
+    "num_attention_heads", "num_key_value_heads", "max_seq_len",
+    "initial_context_length", "rope_theta", "rope_scaling_factor",
+    "sliding_window", "swiglu_limit"
 ]
 
 CATEGORIES = [
+    #
     "embedding.weight",
     "unembedding.weight",
     "attn.norm.scale",
@@ -66,6 +47,7 @@ def binarize_config(cfg):
     config_bin = b""
     for key in KEYS:
         val = cfg[key]
+        print("key", key, "val", val)
         if isinstance(val, int):
             config_bin += struct.pack("<i", val)
         elif isinstance(val, float):
@@ -76,7 +58,7 @@ def binarize_config(cfg):
 
 
 def binarize_weights(state_dict, dtype="float32"):
-    # reorder weights such that it is compatible with llama2.c loading
+    # reorder weights such that it is compatible to Karpathy's llama2.c loading script
     buckets = {cat: [] for cat in CATEGORIES}
     others = []
     for key in state_dict:
@@ -93,51 +75,56 @@ def binarize_weights(state_dict, dtype="float32"):
 
     reordered = OrderedDict()
     for cat in CATEGORIES:
-        for _, key in buckets[cat]:
+        sorted_bucket = sorted(buckets[cat], key=lambda x: x[0])
+        for _, key in sorted_bucket:
             reordered[key] = state_dict[key]
     for key in sorted(others):
         reordered[key] = state_dict[key]
 
     # convert to binary
     np_dtype = np.float32 if dtype == "float32" else np.bfloat16
-    torch_dtype = torch.float32 if dtype == "float32" else torch.bfloat16
+    torch_dtype = torch.float32 if dtype == "float32" else np.bfloat16
     weights_bin = b""
     for name, tensor in reordered.items():
         np_tensor = tensor.detach().cpu().to(torch_dtype).numpy().astype(
             np_dtype)
         weights_bin += np_tensor.tobytes()
+        print(f"Binarized {name}")
 
     return weights_bin
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Generate .bin from config + safetensors.")
-    parser.add_argument("--config", required=True, help="Path to config.json")
-    parser.add_argument("--input",
-                        required=True,
-                        help="Path to converted model.safetensors")
-    parser.add_argument("--output",
-                        required=True,
-                        help="Path to write .bin file")
-    return parser.parse_args()
+def parseCLIArgs():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c",
+                        "--config",
+                        type=str,
+                        help="Path to config.json file")
+    parser.add_argument("-i",
+                        "--input",
+                        type=str,
+                        help="Path to input .safetensors file")
+    parser.add_argument("-o",
+                        "--output",
+                        type=str,
+                        help="Path to output .bin file")
+
+    args = parser.parse_args()
+    return args
 
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    print(f"Loading config: {args.config}")
+    args = parseCLIArgs()
+    cfg = args.config
+    inp = args.input
+    out = args.output
     with open(args.config, "r") as f:
-        config = json.load(f)
+        config_json = json.load(f)
 
-    config_bin = binarize_config(config)
+    config_bin = binarize_config(config_json)
 
-    print(f"Loading weights: {args.input}")
-    state_dict = load_file(args.input)
+    state_dict = load_file(inp)
     weights_bin = binarize_weights(state_dict)
-
-    print(f"Writing output binary: {args.output}")
-    with open(args.output, "wb") as f:
+    print("Writing to file ...")
+    with open(out, "wb") as f:
         f.write(config_bin + weights_bin)
-
-    print("Done.")
