@@ -1,3 +1,19 @@
+# Environment Setup
+
+```bash
+# gpt-oss
+export GPT_OSS_REPO_ROOT="/nfs/gpu_trainee/user/gpt-oss" # TODO(user): change to your account name
+cd $GPT_OSS_REPO_ROOT
+
+# Create and activate a Python 3.10 virtual environment
+python3.10 -m venv .venv
+source .venv/bin/activate
+
+# Model paths
+export MODELS_ROOT="/nfs/gpu_trainee/final-project/models"
+export MODELBIN_ROOT="/nfs/gpu_trainee/final-project/modelbin"
+```
+
 # Main program
 
 The main function at `run.cpp`
@@ -16,9 +32,9 @@ make runomp # Compiled with -O3 and -fopenmp
 Example:
 
 ```bash
-./run /nfs/gpu_trainee/final-project/modelbin/gpt-oss-20B.bin -m getp -i data/input.txt -o data/output.txt
-./run /nfs/gpu_trainee/final-project/modelbin/gpt-oss-20B.bin -m chat
-./run /nfs/gpu_trainee/final-project/modelbin/gpt-oss-20B.bin -m generate -i "1+1="
+./run "${MODELBIN_ROOT}/gpt-oss-20B.bin" -m getp -i data/input.txt -o data/output.txt
+./run "${MODELBIN_ROOT}/gpt-oss-20B.bin" -m chat
+./run "${MODELBIN_ROOT}/gpt-oss-20B.bin" -m generate -i "1+1="
 ```
 
 ## Visualize `getp` mode output

@@ -8,9 +8,10 @@
   "head_dim": 32,
   "num_attention_heads": 2,
   "num_key_value_heads": 1,
-  "max_seq_len": 256,
+	"max_seq_len": 2048,
   "initial_context_length": 4096,
   "rope_theta": 150000,
+  "rope_scaling_factor": 32.0,
   "sliding_window": 128,
   "swiglu_limit": 7.0
 }
