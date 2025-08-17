@@ -6,7 +6,8 @@
 #include "tokenizer.hpp"
 
 void error_usage() {
-  fprintf(stderr, "Usage:   decode <line_number> [options]\n<line_number> can be negative to decode all lines\n");
+  fprintf(stderr, "Usage:   decode <line_number> [options]\n<line_number> can "
+                  "be negative to decode all lines\n");
   fprintf(stderr, "Example: decode 0 -i data/output.txt\n");
   fprintf(stderr, "Options:\n");
   fprintf(stderr, "  -i <string> (optional) input tokens file, default: "
