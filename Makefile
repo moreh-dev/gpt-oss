@@ -1,10 +1,9 @@
 # use hipcc as default
 # if hipcc isn't available, use g++
 CC := $(shell command -v hipcc 2>/dev/null || echo g++)
-ifneq ($(CC),g++)
-CFLAGS = --std=c++17 -lm --offload-arch=gfx90a
-else
 CFLAGS = --std=c++17 -lm
+ifneq ($(CC),g++)
+CFLAGS += --offload-arch=gfx90a
 endif
 
 CPP_FILES = run.cpp tokenizer.cpp
