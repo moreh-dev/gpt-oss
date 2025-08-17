@@ -25,5 +25,5 @@ build/
 # Binaries
 *.safetensors
 *.bin
-run
-decode
+*
+!*.*
