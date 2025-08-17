@@ -35,8 +35,8 @@ decode: decode.cpp tokenizer.cpp tokenizer-bin
 	$(CC) $(CFLAGS) -O3 decode.cpp tokenizer.cpp -o decode
 
 .PHONY: tokenizer-bin
-tokenizer-bin: export_o200k_bin.py
-	python3 export_o200k_bin.py -o tokenizer.bin
+tokenizer-bin: export_tokenizer_bin.py
+	python3 export_tokenizer_bin.py -o tokenizer.bin
 
 .PHONY: tokenizer-test
 tokenizer-test: test_tokenizer.cpp tokenizer.cpp tokenizer-bin
