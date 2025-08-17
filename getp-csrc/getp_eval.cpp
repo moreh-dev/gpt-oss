@@ -86,6 +86,7 @@ int write_outputfile(const char *output_filename, Requests *reqs) {
       }
       writeFile << "\n";
     }
+    writeFile << "\n";
     writeFile.close();
   } else {
     fprintf(stderr, "cannot write the file: %s\n", output_filename);
