@@ -1,5 +1,18 @@
-# Wrapping config and weights in to a .bin file
+"""
+generate_bin.py
+---------------
+Wraps a converted checkpoint (safetensors) and its config.json
+into a single `.bin` file compatible with the GPT-OSS C++ runtime.
 
+Usage
+-----
+python generate_bin.py \
+  --config config.json \
+  --input  model.safetensors \
+  --output gpt-oss-7M.bin
+"""
+
+import argparse
 from collections import OrderedDict
 import json
 import re
@@ -21,14 +34,13 @@ KEYS = [
     "num_attention_heads",
     "num_key_value_heads",
     "max_seq_len",
-    #"initial_context_length",
-    #"rope_theta",
-    #"sliding_window",
-    #"swiglu_limit"
+    # "initial_context_length",
+    # "rope_theta",
+    # "sliding_window",
+    # "swiglu_limit"
 ]
 
 CATEGORIES = [
-    #
     "embedding.weight",
     "unembedding.weight",
     "attn.norm.scale",
@@ -64,7 +76,7 @@ def binarize_config(cfg):
 
 
 def binarize_weights(state_dict, dtype="float32"):
-    # reorder weights such that it is compatible to Karpathy's llama2.c loading script
+    # reorder weights such that it is compatible with llama2.c loading
     buckets = {cat: [] for cat in CATEGORIES}
     others = []
     for key in state_dict:
@@ -88,7 +100,7 @@ def binarize_weights(state_dict, dtype="float32"):
 
     # convert to binary
     np_dtype = np.float32 if dtype == "float32" else np.bfloat16
-    torch_dtype = torch.float32 if dtype == "float32" else np.bfloat16
+    torch_dtype = torch.float32 if dtype == "float32" else torch.bfloat16
     weights_bin = b""
     for name, tensor in reordered.items():
         np_tensor = tensor.detach().cpu().to(torch_dtype).numpy().astype(
@@ -98,13 +110,34 @@ def binarize_weights(state_dict, dtype="float32"):
     return weights_bin
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate .bin from config + safetensors.")
+    parser.add_argument("--config", required=True, help="Path to config.json")
+    parser.add_argument("--input",
+                        required=True,
+                        help="Path to converted model.safetensors")
+    parser.add_argument("--output",
+                        required=True,
+                        help="Path to write .bin file")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    with open("config.json", "r") as f:
+    args = parse_args()
+
+    print(f"Loading config: {args.config}")
+    with open(args.config, "r") as f:
         config = json.load(f)
 
     config_bin = binarize_config(config)
 
-    state_dict = load_file("model.safetensors")
+    print(f"Loading weights: {args.input}")
+    state_dict = load_file(args.input)
     weights_bin = binarize_weights(state_dict)
-    with open("gpt-oss-7M.bin", "wb") as f:
+
+    print(f"Writing output binary: {args.output}")
+    with open(args.output, "wb") as f:
         f.write(config_bin + weights_bin)
+
+    print("Done.")

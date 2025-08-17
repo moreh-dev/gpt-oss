@@ -14,7 +14,7 @@ Usage
 python export_model_bin.py \
   --input original.safetensors \
   --config config.json \
-  --out gpt-oss-20B.bin
+  --output gpt-oss-20B.bin
 """
 
 import argparse
@@ -272,7 +272,7 @@ def parse_args():
         required=True,
         help="Path to input .safetensors (may contain .blocks/.scales)")
     p.add_argument("--config", required=True, help="Path to config.json")
-    p.add_argument("--out", required=True, help="Output .bin path")
+    p.add_argument("--output", required=True, help="Output .bin path")
     p.add_argument(
         "--dtype",
         choices=["float32", "bfloat16"],
@@ -296,14 +296,14 @@ def main():
         ordered = reorder_keys_for_write(all_keys)
 
         # Write binary in one pass
-        with open(args.out, "wb") as fout:
+        with open(args.output, "wb") as fout:
             write_config_header(config, fout)
             write_weights_streaming(providers,
                                     ordered,
                                     fout,
                                     out_dtype=args.dtype)
 
-    print(f"Done. Wrote {args.out}")
+    print(f"Done. Wrote {args.output}")
 
 
 if __name__ == "__main__":
