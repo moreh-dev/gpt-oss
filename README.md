@@ -3,7 +3,7 @@
 ## Export Tokenizer
 
 ```bash
-python export_o200k_bin.py -o tokenizer.bin
+python export_tokenizer_bin.py -o tokenizer.bin
 ```
 
 ## Build & Run Tokenizer Test (C++)
