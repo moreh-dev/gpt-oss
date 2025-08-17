@@ -14,7 +14,7 @@
 // - If -r/--roundtrip is set, decodes pieces back to text and prints it.
 //
 // Notes:
-// - Compatible with export_o200k_bin binary layout:
+// - Compatible with export_tokenizer_bin binary layout:
 //     int32  max_token_length
 //     repeat n_vocab times: float32 score, int32 byte_len, bytes token_bytes
 // - We do a quick pass to count vocab size from the file to call
