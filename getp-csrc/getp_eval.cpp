@@ -1,7 +1,6 @@
 // DO NOT MODIFY THIS FILE
 
 #include <fstream>
-#include <hip/hip_runtime.h>
 #include <iostream>
 
 #ifndef GETP_EVAL
