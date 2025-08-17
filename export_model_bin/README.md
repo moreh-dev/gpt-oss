@@ -1,8 +1,8 @@
 # Model weights
 
 - tiny-random/gpt-oss (7m): [Hugging Face](https://huggingface.co/tiny-random/gpt-oss)
-- openai/gpt-oss-120b (120B): [Hugging Face](https://huggingface.co/openai/gpt-oss-120b)
-- openai/gpt-oss-20b (20B): [Hugging Face](https://huggingface.co/openai/gpt-oss-20b)
+- openai/gpt-oss-120b (120b): [Hugging Face](https://huggingface.co/openai/gpt-oss-120b)
+- openai/gpt-oss-20b (20b): [Hugging Face](https://huggingface.co/openai/gpt-oss-20b)
 
 The downloaded model checkpoints are provided in **safetensors** format.
 Before they can be used with the C++ inference runtime, these weights must be **exported into a single `.bin` file**.

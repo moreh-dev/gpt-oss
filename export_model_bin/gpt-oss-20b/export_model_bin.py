@@ -14,7 +14,7 @@ Usage
 python export_model_bin.py \
   --input original.safetensors \
   --config config.json \
-  --output gpt-oss-20B.bin
+  --output gpt-oss-20b.bin
 """
 
 import argparse

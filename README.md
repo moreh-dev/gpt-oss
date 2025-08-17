@@ -32,9 +32,9 @@ make runomp # Compiled with -O3 and -fopenmp
 Example:
 
 ```bash
-./run "${MODELBIN_ROOT}/gpt-oss-20B.bin" -m getp -i data/input.txt -o data/output.txt
-./run "${MODELBIN_ROOT}/gpt-oss-20B.bin" -m chat
-./run "${MODELBIN_ROOT}/gpt-oss-20B.bin" -m generate -i "1+1="
+./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m getp -i data/input.txt -o data/output.txt
+./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m chat
+./run "${MODELBIN_ROOT}/gpt-oss-20b.bin" -m generate -i "1+1="
 ```
 
 ## Visualize `getp` mode output
