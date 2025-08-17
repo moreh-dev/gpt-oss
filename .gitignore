@@ -1,3 +1,8 @@
+# Ignore files with no extension
+*
+!*/**
+!*.*
+
 # Virtual env
 .venv/
 
@@ -25,5 +30,3 @@ build/
 # Binaries
 *.safetensors
 *.bin
-run
-decode

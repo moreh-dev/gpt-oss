@@ -3,13 +3,13 @@
 ## Export Tokenizer
 
 ```bash
-python export_tokenizer_bin.py -o tokenizer.bin
+make tokenizer-bin
 ```
 
 ## Build & Run Tokenizer Test (C++)
 
 ```bash
-g++ -O3 -DTESTING -o test_tokenizer test_tokenizer.cpp tokenizer.cpp -lm
+make tokenizer-test
 ./test_tokenizer -t tokenizer.bin -i "Hello world"
 # Expected output: 13225 2375
 ```
@@ -17,11 +17,11 @@ g++ -O3 -DTESTING -o test_tokenizer test_tokenizer.cpp tokenizer.cpp -lm
 ## Verify Compatibility with Tiktoken
 
 ```bash
-python test_tokenizer.py \
+python3 test_tokenizer.py \
   --bin ./test_tokenizer \
   --tok ./tokenizer.bin \
   --verbose \
-  --prompt prompts.txt
+  --prompt data/input.txt
 ```
 
 ### Example Results
@@ -61,4 +61,36 @@ PROMPT: 'newlines:'
   C  decoded: 'newlines:'
   PY decoded: 'newlines:'
   [ENCODE MATCH] [DECODE MATCH]
+```
+
+# Main program
+
+The main function at `run.cpp`
+Do not modify `run.cpp` `getp_csrc/getp_eval.cpp` `Makefile`
+
+## Build
+
+```bash
+make run  # Default compilation, very slow
+make runfast  # Compiled with -O3 optimization
+make runomp # Compiled with -O3 and -fopenmp
+```
+
+## Run
+
+Example:
+
+```bash
+./run /nfs/gpu_trainee/final-project/modelbin/gpt-oss-20B.bin -m getp -i data/input.txt -o data/output.txt
+./run /nfs/gpu_trainee/final-project/modelbin/gpt-oss-20B.bin -m chat
+./run /nfs/gpu_trainee/final-project/modelbin/gpt-oss-20B.bin -m generate -i "1+1="
+```
+
+## Visualize `getp` mode output
+
+For `getp` mode the output file contains list of output tokens index of each requests. To convert those indexes into text, you should build and run `decode.cpp`
+
+```bash
+make decode
+./decode -1 -i data/output.txt
 ```

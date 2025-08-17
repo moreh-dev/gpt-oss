@@ -6,11 +6,10 @@
 #include "tokenizer.hpp"
 
 void error_usage() {
-  fprintf(stderr, "Usage:   decode [options]\n");
-  fprintf(stderr, "Example: decode -p 0 -i data/output.txt\n");
+  fprintf(stderr, "Usage:   decode <line_number> [options]\n<line_number> can "
+                  "be negative to decode all lines\n");
+  fprintf(stderr, "Example: decode 0 -i data/output.txt\n");
   fprintf(stderr, "Options:\n");
-  fprintf(stderr, "  -p <int> (optional) line number to decode, default: -1 "
-                  "for all lines\n");
   fprintf(stderr, "  -i <string> (optional) input tokens file, default: "
                   "data/output.txt\n");
   fprintf(stderr, "  -z <string> (optional) optional path to custom tokenizer, "
@@ -19,13 +18,16 @@ void error_usage() {
 }
 
 int main(int argc, char **argv) {
-  int line_to_decode = -1;
+  int line_to_decode;
   std::string input_path = "data/output.txt";
   std::string tokenizer_path = "tokenizer.bin";
   const int vocab_size = 201088;
 
-  if (argc >= 2)
+  if (argc >= 2) {
     line_to_decode = atoi(argv[1]);
+  } else {
+    error_usage();
+  }
   for (int i = 2; i < argc; i += 2) {
     // do some basic validation
     if (i + 1 >= argc) {
@@ -42,6 +44,8 @@ int main(int argc, char **argv) {
       input_path = argv[i + 1];
     } else if (strcmp(argv[i], "-z") == 0) {
       tokenizer_path = argv[i + 1];
+    } else {
+      error_usage();
     }
   }
 
