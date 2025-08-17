@@ -3,7 +3,7 @@
 #include <sstream>
 #include <string>
 
-#include "tokenizer.h"
+#include "tokenizer.hpp"
 
 void error_usage() {
   fprintf(stderr, "Usage:   decode [options]\n");

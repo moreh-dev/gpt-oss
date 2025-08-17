@@ -18,7 +18,7 @@
 #include <unistd.h>
 #endif
 
-#include "tokenizer.h"
+#include "tokenizer.hpp"
 
 // ----------------------------------------------------------------------------
 
