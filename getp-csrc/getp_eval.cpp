@@ -19,8 +19,8 @@ void build_requests(Requests *reqs, int num_reqs, int max_token_len,
   reqs->num_reqs = num_reqs;
   reqs->max_token_len = max_token_len;
   reqs->max_seq_len = max_seq_len;
-  reqs->str_reqs =
-      (char *)calloc(num_reqs * max_token_len * (max_seq_len + 1), sizeof(char));
+  reqs->str_reqs = (char *)calloc(num_reqs * max_token_len * (max_seq_len + 1),
+                                  sizeof(char));
   reqs->tok_gens = (int *)calloc(num_reqs * (max_seq_len + 1), sizeof(int));
   printf("requests size = %lu B\n",
          ((num_reqs * max_token_len * (max_seq_len + 1) * sizeof(char)) * 2));
