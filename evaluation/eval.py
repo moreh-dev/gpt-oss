@@ -137,11 +137,6 @@ def eval_reference_based(ids: List[str], refs: List[Dict], subm: List[Dict]):
 	preds_completion = [preds_dict[i] for i in ids]
 	gts_completion   = [refs_dict[i] for i in ids]
 
-	#meteor_scores = [
-	#	meteor.compute(predictions=[p], references=[r])["meteor"]
-	#	for p, r in zip(preds_completion, gts_completion)
-	#]
-
 	meteor_value = meteor.compute(
 		predictions=preds_completion,
 		references=gts_completion
@@ -157,7 +152,6 @@ def eval_reference_based(ids: List[str], refs: List[Dict], subm: List[Dict]):
 
 	agg = {
 		"items": len(ids),
-		#"METEOR": round(statistics.fmean(meteor_scores), 6),
 		"METEOR":round(float(meteor_value), 6),
 		"BERTScore_F1": round(statistics.fmean(bs["f1"]), 6),
 		"BERTScore_P": round(statistics.fmean(bs["precision"]), 6),

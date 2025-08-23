@@ -1,6 +1,6 @@
 # Dataset Format (`.jsonl`)
 
-Each line in the file is a valid JSON object with the following fields:
+- Each line in the file is a valid JSON object with the following fields:
 
 ```json
 {
@@ -10,3 +10,7 @@ Each line in the file is a valid JSON object with the following fields:
 }
 ```
 
+- To run
+```bash
+python eval.py -p ../data/input.txt -s ../data/output.txt -r refs_openai_gpt5.jsonl
+```
