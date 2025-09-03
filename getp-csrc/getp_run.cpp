@@ -22,7 +22,7 @@
 #include <hip/hip_fp16.h>
 #include <omp.h>
 
-#include "tokenizer.hpp"
+#include "../tokenizer.hpp"
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -37,116 +37,6 @@
     exit(1); \
   } \
 } while(0)
-
-static inline long time_in_ms() {
-  struct timespec time;
-  clock_gettime(CLOCK_REALTIME, &time);
-  return time.tv_sec * 1000 + time.tv_nsec / 1000000;
-}
-
-// ----------------------------- Model structs -----------------------------
-
-typedef struct {
-  // Model Config
-  int vocab_size;
-  int hidden_dim;
-  // MLP Config
-  int n_experts;
-  int experts_per_token;
-  int intermediate_dim;
-  int n_layers;
-  // Attention Config
-  int head_dim;
-  int n_attn_heads;
-  int n_kv_heads;
-  int seq_len;
-  int initial_context_length;
-  float rope_theta;
-  float rope_scaling_factor;
-  int sliding_window;
-  float swiglu_limit;
-} Config;
-
-typedef struct {
-  // host pointers mapped from file
-  float *token_embedding_table; // (vocab, hidden)
-  float *rms_attn_w;            // (layers, hidden)
-  float *rms_ffn_w;             // (layers, hidden)
-  float *w_qkv;                 // (layers, (Hq+2Hk) * hidden)
-  float *w_o;                   // (layers, hidden * (Hq))
-  float *b_qkv;                 // (layers, Hq + 2Hk)
-  float *b_o;                   // (layers, hidden)
-  float *attn_sinks;            // (layers, n_attn_heads)
-  float *w_router;              // (layers, hidden * n_experts)
-  float *b_router;              // (layers, n_experts)
-  float *w_mlp1;                // (layers, n_experts, 2*intermediate, hidden)
-  float *w_mlp2;                // (layers, n_experts, hidden, intermediate)
-  float *b_mlp1;                // (layers, n_experts, 2*intermediate)
-  float *b_mlp2;                // (layers, n_experts, hidden)
-  float *rms_out_w;             // (hidden)
-  float *out;                   // (vocab, hidden)
-} WeightsCPU;
-
-typedef struct {
-  // device buffers (mirrors of weights)
-  float *token_embedding_table;
-  float *rms_attn_w;
-  float *rms_ffn_w;
-  float *w_qkv;
-  float *w_o;
-  float *b_qkv;
-  float *b_o;
-  float *attn_sinks;
-  float *w_router;
-  float *b_router;
-  float *w_mlp1;
-  float *w_mlp2;
-  float *b_mlp1;
-  float *b_mlp2;
-  float *rms_out_w;
-  float *out;
-} WeightsGPU;
-
-typedef struct {
-  // host pinned or device runtime buffers
-  // On device:
-  float *x;         // (hidden)
-  float *t;         // (hidden)
-  float *tb;        // (n_attn_heads * head_dim)
-  float *tb2;       // (hidden)
-  float *router;    // (n_experts)
-  float *topk_v;    // (experts_per_token)
-  int   *topk_i;    // (experts_per_token)
-  float *mlp1_out;  // (2*intermediate)
-  float *gate;      // (intermediate)
-  float *up;        // (intermediate)
-  float *gate_up;   // (intermediate)
-  float *e_agg;     // (hidden)
-
-  float *qkv;       // (head_dim * (n_attn_heads + 2*n_kv_heads))
-  float *q;         // (n_attn_heads * head_dim)
-  float *k_cur;     // view into kv cache for pos
-  float *v_cur;     // same
-  float *att;       // (n_attn_heads * (seq_len+1))  (+sink)
-  float *logits;    // (vocab)
-
-  // KV cache (device)
-  float *key_cache;   // (layers * seq_len * kv_dim)
-  float *value_cache; // (layers * seq_len * kv_dim)
-
-  // mask for sliding window (device; optional)
-  float *mask;        // (seq_len * seq_len) if sliding_window > 0
-} RunStateGPU;
-
-typedef struct {
-  Config cfg;
-  WeightsCPU wcpu;
-  WeightsGPU wgpu;
-  RunStateGPU s;
-  int fd;
-  float *mapped;     // host mapping
-  ssize_t file_size;
-} TransformerGPU;
 
 // ------------------------------ HIP kernels ------------------------------
 
@@ -443,21 +333,23 @@ static void attn_scores_gpu(const float *q, const float *k_cache,
                      sliding_window, apply);
 }
 
-static void softmax_rows_gpu(float *att, int n_heads, int row_len) {
-  // one block per row; use shared mem reductions
+static void softmax_rows_gpu(float *att, int n_heads, int row_len, int row_stride) {
+  const int BS = 256;
   for (int h=0; h<n_heads; ++h) {
-    float *row = att + h*row_len;
-    int bs = 256;
-    hipLaunchKernelGGL(k_softmax_row, dim3(1), dim3(bs), bs*sizeof(float), 0, row, row_len);
+    float *row = att + (size_t)h * row_stride; 
+    hipLaunchKernelGGL(k_softmax_row, dim3(1), dim3(BS), BS*sizeof(float), 0, row, row_len);
   }
 }
 
 static void attn_weighted_sum_gpu(const float *att, const float *v_cache,
                                   float *tb, int head_dim, int kv_mul,
                                   int seq_len, int pos, int kv_dim, int n_heads) {
+  int row_len = pos + 2;           
+  int row_stride = seq_len + 1;
   dim3 grid(n_heads), block(head_dim);
   hipLaunchKernelGGL(k_attn_weighted_sum, grid, block, 0, 0,
-                     att, v_cache, tb, head_dim, kv_mul, seq_len, pos, kv_dim, n_heads);
+                     att, v_cache, tb, head_dim, kv_mul,
+                     row_stride, pos, kv_dim, n_heads);
 }
 
 static void swiglu_gpu(float *gate, float *up, float *out,
@@ -530,28 +422,6 @@ static void compute_cos_sin_host(int pos, float base, int head_dim,
 
 // ------------------------------- Sampler ---------------------------------
 
-typedef struct {
-  int vocab_size;
-  float temperature;
-  float topp;
-  unsigned long long rng_state;
-  struct ProbIndex { float prob; int index; } *probindex;
-} Sampler;
-
-static unsigned int random_u32(unsigned long long *s) {
-  *s ^= *s >> 12; *s ^= *s << 25; *s ^= *s >> 27;
-  return (*s * 0x2545F4914F6CDD1Dull) >> 32;
-}
-static float random_f32(unsigned long long *s) {
-  return (random_u32(s) >> 8) / 16777216.0f;
-}
-
-static void build_sampler(Sampler *S, int vocab, float temp, float topp, unsigned long long seed) {
-  S->vocab_size=vocab; S->temperature=temp; S->topp=topp; S->rng_state=seed;
-  S->probindex = (Sampler::ProbIndex*)malloc(sizeof(Sampler::ProbIndex)*vocab);
-}
-static void free_sampler(Sampler *S){ free(S->probindex); }
-
 static void softmax_host(float *x, int n) {
   float mx=x[0]; for(int i=1;i<n;i++) if (x[i]>mx) mx=x[i];
   double sum=0.0; for(int i=0;i<n;i++){ x[i] = expf(x[i]-mx); sum += x[i]; }
@@ -562,26 +432,13 @@ static int sample_argmax(const float *p, int n) {
   for(int i=1;i<n;i++) if (p[i]>mv){mv=p[i]; m=i;}
   return m;
 }
-static int sample_mult(float *p, int n, float coin) {
-  float c=0.f; for(int i=0;i<n;i++){ c+=p[i]; if (coin < c) return i; }
-  return n-1;
-}
+
 static int cmp_probdesc(const void* A, const void* B) {
-  const Sampler::ProbIndex *a=(const Sampler::ProbIndex*)A;
-  const Sampler::ProbIndex *b=(const Sampler::ProbIndex*)B;
+  const ProbIndex *a=(const ProbIndex*)A;
+  const ProbIndex *b=(const ProbIndex*)B;
   return (a->prob > b->prob) ? -1 : (a->prob < b->prob);
 }
-static int sample_topp(float *p, int n, float topp, Sampler::ProbIndex *buf, float coin) {
-  // crop tiny probs:
-  int n0=0; const float cutoff=(1.0f - topp)/(n-1);
-  for(int i=0;i<n;i++) if (p[i] >= cutoff){ buf[n0].index=i; buf[n0].prob=p[i]; n0++; }
-  qsort(buf, n0, sizeof(buf[0]), cmp_probdesc);
-  float cp=0.f; int last=n0-1;
-  for(int i=0;i<n0;i++){ cp+=buf[i].prob; if (cp>topp){ last=i; break; } }
-  float r = coin * cp, c=0.f;
-  for(int i=0;i<=last;i++){ c+=buf[i].prob; if (r<c) return buf[i].index; }
-  return buf[last].index;
-}
+
 static int sample_token(Sampler *S, float *logits) {
   int next;
   if (S->temperature==0.0f) {
@@ -614,119 +471,119 @@ static void topk_host(float *topk_v, int *topk_i, const float *scores, int n, in
 
 // -------------------------- File mapping (host) --------------------------
 
-static void memory_map_weights(WeightsCPU *w, const Config *c, float *ptr) {
-  int head_dim = c->head_dim;
-  int n_layers = c->n_layers;
-  int n_experts = c->n_experts;
+void memory_map_weights_gpu(TransformerWeights *w, Config *cfg, float *ptr) {
+  int head_dim = cfg->head_dim;
+  int n_layers = cfg->n_layers;
+  int n_experts = cfg->n_experts;
 
-  w->token_embedding_table = ptr;
-  ptr += 1ll * c->vocab_size * c->hidden_dim;
-
-  w->out = ptr;
-  ptr += 1ll * c->vocab_size * c->hidden_dim;
-
-  w->rms_attn_w = ptr;
-  ptr += 1ll * n_layers * c->hidden_dim;
-
-  w->rms_ffn_w = ptr;
-  ptr += 1ll * n_layers * c->hidden_dim;
-
-  w->rms_out_w = ptr;
-  ptr += 1ll * c->hidden_dim;
-
-  w->w_qkv = ptr;
-  ptr += 1ll * n_layers * c->hidden_dim *
-         (head_dim * c->n_attn_heads + 2 * head_dim * c->n_kv_heads);
-
-  w->b_qkv = ptr;
+  to_device(&w->token_embedding_table, ptr, 1ll*cfg->vocab_size*cfg->hidden_dim*sizeof(float));
+  ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
+  to_device(&w->out, ptr, 1ll*cfg->vocab_size*cfg->hidden_dim*sizeof(float));
+  ptr += 1ll * cfg->vocab_size * cfg->hidden_dim;
+  to_device(&w->rms_attn_w, ptr, 1ll * n_layers * cfg->hidden_dim * sizeof(float));
+  ptr += 1ll * n_layers * cfg->hidden_dim;
+  to_device(&w->rms_ffn_w, ptr, 1ll * n_layers * cfg->hidden_dim * sizeof(float));
+  ptr += 1ll * n_layers * cfg->hidden_dim;
+  to_device(&w->rms_out_w, ptr, 1ll * cfg->hidden_dim * sizeof(float));
+  ptr += 1ll * cfg->hidden_dim;
+  // hey it's qkvqkv, not qqkkvv
+  to_device(&w->w_qkv, ptr,
+            1ll * n_layers * cfg->hidden_dim *
+            (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads) *
+            sizeof(float));
+  ptr += 1ll * n_layers * cfg->hidden_dim *
+         (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
+  to_device(&w->b_qkv, ptr,
+            1ll * n_layers * (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads) *
+            sizeof(float));
   ptr += 1ll * n_layers *
-         (head_dim * c->n_attn_heads + 2 * head_dim * c->n_kv_heads);
-
-  w->w_o = ptr;
-  ptr += 1ll * n_layers * (head_dim * c->n_attn_heads) * c->hidden_dim;
-
-  w->b_o = ptr;
-  ptr += 1ll * n_layers * c->hidden_dim;
-
-  w->attn_sinks = ptr;
-  ptr += 1ll * n_layers * c->n_attn_heads;
-
-  w->w_router = ptr;
-  ptr += 1ll * n_layers * c->hidden_dim * n_experts;
-
-  w->b_router = ptr;
+         (head_dim * cfg->n_attn_heads + 2 * head_dim * cfg->n_kv_heads);
+  to_device(&w->w_o, ptr,
+            1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim *
+            sizeof(float));
+  ptr += 1ll * n_layers * (head_dim * cfg->n_attn_heads) * cfg->hidden_dim;
+  to_device(&w->b_o, ptr, 1ll * n_layers * cfg->hidden_dim * sizeof(float));
+  ptr += 1ll * n_layers * cfg->hidden_dim;
+  to_device(&w->attn_sinks, ptr, 1ll * n_layers * cfg->n_attn_heads * sizeof(float));
+  ptr += 1ll * n_layers * cfg->n_attn_heads;
+  to_device(&w->w_router, ptr, 1ll * n_layers * cfg->hidden_dim * n_experts * sizeof(float));
+  ptr += 1ll * n_layers * cfg->hidden_dim * n_experts;
+  to_device(&w->b_router, ptr, 1ll * n_layers * n_experts * sizeof(float));
   ptr += 1ll * n_layers * n_experts;
-
-  w->w_mlp1 = ptr;
-  ptr += 1ll * n_layers * n_experts * 2 * c->intermediate_dim * c->hidden_dim;
-
-  w->b_mlp1 = ptr;
-  ptr += 1ll * n_layers * n_experts * 2 * c->intermediate_dim;
-
-  w->w_mlp2 = ptr;
-  ptr += 1ll * n_layers * n_experts * c->hidden_dim * c->intermediate_dim;
-
-  w->b_mlp2 = ptr;
-  ptr += 1ll * n_layers * n_experts * c->hidden_dim;
+  // hey it's gate_upgate_up, not gategateupup
+  to_device(&w->w_mlp1, ptr,
+            1ll * n_layers * n_experts * cfg->hidden_dim * 2 * cfg->intermediate_dim *
+            sizeof(float));
+  ptr +=
+      1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * cfg->hidden_dim;
+  to_device(&w->b_mlp1, ptr, 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim * sizeof(float));
+  ptr += 1ll * n_layers * n_experts * 2 * cfg->intermediate_dim;
+  to_device(&w->w_mlp2, ptr,
+            1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim *
+            sizeof(float));
+  ptr += 1ll * n_layers * n_experts * cfg->hidden_dim * cfg->intermediate_dim;
+  to_device(&w->b_mlp2, ptr, 1ll * n_layers * n_experts * cfg->hidden_dim * sizeof(float));
+  ptr += 1ll * n_layers * n_experts * cfg->hidden_dim;
 }
 
-static void load_checkpoint(const char *path, Config *cfg,
-                            WeightsCPU *w, int *fd,
-                            float **mapped, ssize_t *fsize) {
-  FILE *f = fopen(path, "rb");
-  if (!f) { fprintf(stderr, "open %s failed\n", path); exit(1); }
-  if (fread(cfg, sizeof(Config), 1, f) != 1) { fprintf(stderr, "bad header\n"); exit(1); }
-  fseek(f, 0, SEEK_END);
-  *fsize = ftell(f);
-  fclose(f);
+void load_checkpoint_gpu(char *ckpt, Config *config, TransformerWeights *weights,
+                     int *fd, float **data, ssize_t *file_size) {
+  FILE *file = fopen(ckpt, "rb");
+  if (!file) {
+    fprintf(stderr, "Couldn't open file %s\n", ckpt);
+    exit(EXIT_FAILURE);
+  }
 
-  *fd = open(path, O_RDONLY);
-  if (*fd == -1) { fprintf(stderr, "open() failed\n"); exit(1); }
+  // read in the config header
+  // load sizeof(Config) bytes into config
+  if (fread(config, sizeof(Config), 1, file) != 1) {
+    exit(EXIT_FAILURE);
+  }
+  // figure out the file size
+  printf("vocab_size: %d\n", config->vocab_size);
+  printf("hidden_dim: %d\n", config->hidden_dim);
+  printf("n_experts: %d\n", config->n_experts);
+  printf("experts_per_token: %d\n", config->experts_per_token);
+  printf("intermediate_dim: %d\n", config->intermediate_dim);
+  printf("n_layers: %d\n", config->n_layers);
+  printf("head_dim: %d\n", config->head_dim);
+  printf("n_attn_heads: %d\n", config->n_attn_heads);
+  printf("n_kv_heads: %d\n", config->n_kv_heads);
+  printf("max_seq_len: %d\n", config->seq_len);
+  printf("init context len: %d\n", config->initial_context_length);
+  printf("rope theta: %f\n", config->rope_theta);
+  printf("rope_scaling_factor: %f\n", config->rope_scaling_factor);
+  printf("sliding window: %d\n", config->sliding_window);
+  printf("swiglu_limit: %f\n", config->swiglu_limit);
+  fseek(file, 0, SEEK_END); // move file pointer to end of file
 
-  *mapped = (float*)mmap(NULL, *fsize, PROT_READ, MAP_PRIVATE, *fd, 0);
-  if (*mapped == MAP_FAILED) { fprintf(stderr, "mmap failed\n"); exit(1); }
-
-  float *weights_ptr = *mapped + (sizeof(Config) / sizeof(float));
-  memory_map_weights(w, cfg, weights_ptr);
-
-  // Log
-  printf("[ckpt] vocab=%d hidden=%d layers=%d heads(q)=%d kv_heads=%d head_dim=%d seq_len=%d\n",
-         cfg->vocab_size, cfg->hidden_dim, cfg->n_layers,
-         cfg->n_attn_heads, cfg->n_kv_heads, cfg->head_dim, cfg->seq_len);
+  *file_size = ftell(file); // get the file size, in bytes
+  fclose(file);
+  // memory map the Transformer weights into the data pointer
+  *fd = open(ckpt, O_RDONLY); // open in read only mode
+  if (*fd == -1) {
+    fprintf(stderr, "open failed\n");
+    exit(EXIT_FAILURE);
+  }
+  *data = reinterpret_cast<float *>(
+      mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0));
+  if (*data == MAP_FAILED) {
+    fprintf(stderr, "mmap failed!\n");
+    exit(EXIT_FAILURE);
+  }
+  float *weights_ptr = *data + sizeof(Config) / sizeof(float);
+  memory_map_weights_gpu(weights, config, weights_ptr);
 }
 
-static void upload_weights(TransformerGPU *T) {
-  const Config &c = T->cfg;
-  const WeightsCPU &w = T->wcpu;
-  WeightsGPU &g = T->wgpu;
-
-  to_device(&g.token_embedding_table, w.token_embedding_table, 1ll*c.vocab_size*c.hidden_dim*sizeof(float));
-  to_device(&g.out,                w.out,                1ll*c.vocab_size*c.hidden_dim*sizeof(float));
-  to_device(&g.rms_attn_w,         w.rms_attn_w,         1ll*c.n_layers*c.hidden_dim*sizeof(float));
-  to_device(&g.rms_ffn_w,          w.rms_ffn_w,          1ll*c.n_layers*c.hidden_dim*sizeof(float));
-  to_device(&g.rms_out_w,          w.rms_out_w,          1ll*c.hidden_dim*sizeof(float));
-  to_device(&g.w_qkv,              w.w_qkv,              1ll*c.n_layers*c.hidden_dim*(c.head_dim*c.n_attn_heads + 2*c.head_dim*c.n_kv_heads)*sizeof(float));
-  to_device(&g.b_qkv,              w.b_qkv,              1ll*c.n_layers*(c.head_dim*c.n_attn_heads + 2*c.head_dim*c.n_kv_heads)*sizeof(float));
-  to_device(&g.w_o,                w.w_o,                1ll*c.n_layers*(c.head_dim*c.n_attn_heads)*c.hidden_dim*sizeof(float));
-  to_device(&g.b_o,                w.b_o,                1ll*c.n_layers*c.hidden_dim*sizeof(float));
-  to_device(&g.attn_sinks,         w.attn_sinks,         1ll*c.n_layers*c.n_attn_heads*sizeof(float));
-  to_device(&g.w_router,           w.w_router,           1ll*c.n_layers*c.hidden_dim*c.n_experts*sizeof(float));
-  to_device(&g.b_router,           w.b_router,           1ll*c.n_layers*c.n_experts*sizeof(float));
-  to_device(&g.w_mlp1,             w.w_mlp1,             1ll*c.n_layers*c.n_experts*2*c.intermediate_dim*c.hidden_dim*sizeof(float));
-  to_device(&g.b_mlp1,             w.b_mlp1,             1ll*c.n_layers*c.n_experts*2*c.intermediate_dim*sizeof(float));
-  to_device(&g.w_mlp2,             w.w_mlp2,             1ll*c.n_layers*c.n_experts*c.hidden_dim*c.intermediate_dim*sizeof(float));
-  to_device(&g.b_mlp2,             w.b_mlp2,             1ll*c.n_layers*c.n_experts*c.hidden_dim*sizeof(float));
-}
-
-static void malloc_state(TransformerGPU *T) {
-  const Config &c = T->cfg;
-  RunStateGPU &s = T->s;
+static void malloc_state_gpu(Transformer *T) {
+  const Config &c = T->config;
+  RunState &s = T->state;
 
   alloc_device(&s.x,        c.hidden_dim*sizeof(float), 0.f, true);
   alloc_device(&s.t,        c.hidden_dim*sizeof(float), 0.f, true);
   alloc_device(&s.tb,       c.head_dim*c.n_attn_heads*sizeof(float), 0.f, true);
   alloc_device(&s.tb2,      c.hidden_dim*sizeof(float), 0.f, true);
-  alloc_device(&s.router,   c.n_experts*sizeof(float), 0.f, true);
+  alloc_device(&s.router_score,   c.n_experts*sizeof(float), 0.f, true);
   HIP_CHECK(hipMalloc((void**)&s.topk_v, c.experts_per_token*sizeof(float)));
   HIP_CHECK(hipMalloc((void**)&s.topk_i, c.experts_per_token*sizeof(int)));
   alloc_device(&s.mlp1_out, 2*c.intermediate_dim*sizeof(float), 0.f, true);
@@ -763,40 +620,31 @@ static void malloc_state(TransformerGPU *T) {
   }
 }
 
-static void build_transformer(TransformerGPU *T, const char *ckpt) {
-  T->fd = -1; T->mapped = nullptr; T->file_size = 0;
-  hipSetDevice(0); // MI250 GCD0
-  load_checkpoint(ckpt, &T->cfg, &T->wcpu, &T->fd, &T->mapped, &T->file_size);
-  upload_weights(T);
-  malloc_state(T);
-}
-
 // ------------------------------ I/O helpers ------------------------------
 
-static void free_transformer(TransformerGPU *T) {
-  if (T->mapped && T->mapped!=MAP_FAILED) munmap(T->mapped, T->file_size);
+static void free_transformer_gpu(Transformer *T) {
+  if (T->data && T->data!=MAP_FAILED) munmap(T->data, T->file_size);
   if (T->fd!=-1) close(T->fd);
 
   // free device weights/state
-  WeightsGPU &g = T->wgpu;
+  TransformerWeights &g = T->weights;
   auto F=[&](float *&p){ if(p){ hipFree(p); p=nullptr; } };
   F(g.token_embedding_table); F(g.rms_attn_w); F(g.rms_ffn_w); F(g.w_qkv); F(g.w_o);
   F(g.b_qkv); F(g.b_o); F(g.attn_sinks); F(g.w_router); F(g.b_router);
   F(g.w_mlp1); F(g.w_mlp2); F(g.b_mlp1); F(g.b_mlp2); F(g.rms_out_w); F(g.out);
 
-  RunStateGPU &s = T->s;
-  F(s.x); F(s.t); F(s.tb); F(s.tb2); F(s.router); if(s.topk_v) hipFree(s.topk_v);
+  RunState &s = T->state;
+  F(s.x); F(s.t); F(s.tb); F(s.tb2); F(s.router_score); if(s.topk_v) hipFree(s.topk_v);
   if(s.topk_i) hipFree(s.topk_i); F(s.mlp1_out); F(s.gate); F(s.up); F(s.gate_up); F(s.e_agg);
   F(s.qkv); F(s.q); F(s.att); F(s.logits); F(s.key_cache); F(s.value_cache);
   if (s.mask) hipFree(s.mask);
 }
 
-static void build_transformer(TransformerGPU *T, const char *ckpt) {
-  T->fd = -1; T->mapped = nullptr; T->file_size = 0;
+static void build_transformer_gpu(Transformer *T, char *ckpt) {
+  T->fd = -1; T->data = nullptr; T->file_size = 0;
   hipSetDevice(0); // MI250 GCD0
-  load_checkpoint(ckpt, &T->cfg, &T->wcpu, &T->fd, &T->mapped, &T->file_size);
-  upload_weights(T);
-  malloc_state(T);
+  load_checkpoint_gpu(ckpt, &T->config, &T->weights, &T->fd, &T->data, &T->file_size);
+  malloc_state_gpu(T);
 }
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
@@ -809,8 +657,8 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   char *checkpoint_path = "model.bin"; // e.g. out/model.bin
   const char *tokenizer_path = "tokenizer.bin";
 
-  build_transformer(&transformer, checkpoint_path);
-  read_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+  build_transformer_gpu(transformer, checkpoint_path);
+  read_tokenizer(tokenizer, tokenizer_path, transformer->config.vocab_size);
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -820,14 +668,14 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
   // - Memory deallocation
   // - Unload model
   // - ...
-  free_transformer(&transformer);
-  free_tokenizer(&tokenizer);
+  free_transformer_gpu(transformer);
+  free_tokenizer(tokenizer);
 }
 
-static float* forward(TransformerGPU *T, int token, int pos) {
-  const Config &p = T->cfg;
-  const WeightsGPU &w = T->wgpu;
-  RunStateGPU &s = T->s;
+static float* forward_gpu(Transformer *T, int token, int pos) {
+  const Config &p = T->config;
+  const TransformerWeights &w = T->weights;
+  RunState &s = T->state;
 
   const int H = p.hidden_dim;
   const int D = p.head_dim;
@@ -853,8 +701,8 @@ static float* forward(TransformerGPU *T, int token, int pos) {
     add_bias_gpu(s.qkv, Bqkv, (D*Hq + 2*D*Hkv));
 
     // split to q,k,v. k/v current position also appended into cache
-    float *k_buf = T->s.key_cache + (size_t)l*p.seq_len*kv_dim + (size_t)pos*kv_dim;
-    float *v_buf = T->s.value_cache + (size_t)l*p.seq_len*kv_dim + (size_t)pos*kv_dim;
+    float *k_buf = T->state.key_cache + (size_t)l*p.seq_len*kv_dim + (size_t)pos*kv_dim;
+    float *v_buf = T->state.value_cache + (size_t)l*p.seq_len*kv_dim + (size_t)pos*kv_dim;
     split_qkv_gpu(s.qkv, s.q, k_buf, v_buf, D, Hq, Hkv);
 
     // --- RoPE for q and k(pos)
@@ -876,8 +724,8 @@ static float* forward(TransformerGPU *T, int token, int pos) {
     HIP_CHECK(hipFree(dcos)); HIP_CHECK(hipFree(dsin));
 
     // --- Attention scores for all heads vs 0..pos
-    float *k_layer_cache = T->s.key_cache + (size_t)l*p.seq_len*kv_dim;
-    float *v_layer_cache = T->s.value_cache + (size_t)l*p.seq_len*kv_dim;
+    float *k_layer_cache = T->state.key_cache + (size_t)l*p.seq_len*kv_dim;
+    float *v_layer_cache = T->state.value_cache + (size_t)l*p.seq_len*kv_dim;
     attn_scores_gpu(s.q, k_layer_cache, (p.sliding_window>0 && (l % 2 == 0))? s.mask: nullptr, s.att,
                     D, kv_mul, p.seq_len, pos, kv_dim, Hq, (l%2==0)?p.sliding_window:0);
 
@@ -896,7 +744,7 @@ static float* forward(TransformerGPU *T, int token, int pos) {
     free(h_sinks);
 
     // softmax over len = pos+2 for each head
-    softmax_rows_gpu(s.att, Hq, pos+2);
+    softmax_rows_gpu(s.att, Hq, pos + 2, p.seq_len + 1);
 
     // weighted sum over V → tb(heads*D)
     attn_weighted_sum_gpu(s.att, v_layer_cache, s.tb, D, kv_mul, p.seq_len, pos, kv_dim, Hq);
@@ -916,15 +764,15 @@ static float* forward(TransformerGPU *T, int token, int pos) {
     // router: router = W_router * t + b_router
     const float *Wr = w.w_router + (size_t)l*H*p.n_experts;
     const float *Br = w.b_router + (size_t)l*p.n_experts;
-    gemv_gpu(s.router, s.t, Wr, H, p.n_experts);
-    add_bias_gpu(s.router, Br, p.n_experts);
+    gemv_gpu(s.router_score, s.t, Wr, H, p.n_experts);
+    add_bias_gpu(s.router_score, Br, p.n_experts);
     HIP_CHECK(hipDeviceSynchronize()); // ensure router on device finished
 
     // Bring router to host → top-k selection on CPU (simple, correct)
     float *h_router = (float*)malloc(p.n_experts*sizeof(float));
     float *h_topk_v = (float*)malloc(p.experts_per_token*sizeof(float));
     int   *h_topk_i = (int*)  malloc(p.experts_per_token*sizeof(int));
-    HIP_CHECK(hipMemcpy(h_router, s.router, p.n_experts*sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(h_router, s.router_score, p.n_experts*sizeof(float), hipMemcpyDeviceToHost));
     topk_host(h_topk_v, h_topk_i, h_router, p.n_experts, p.experts_per_token);
     HIP_CHECK(hipMemcpy(s.topk_v, h_topk_v, p.experts_per_token*sizeof(float), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(s.topk_i, h_topk_i, p.experts_per_token*sizeof(int),   hipMemcpyHostToDevice));
@@ -1026,7 +874,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   while (pos < steps) {
 
     // forward the transformer to get logits for the next token
-    float *logits = forward(transformer, token, pos);
+    float *logits = forward_gpu(transformer, token, pos);
 
     // advance the state machine
     pos++;
