@@ -4,7 +4,7 @@
 
 ```bash
 # python generate.py /path/to/gpt-oss/safetensors -p /path/to/prompt/file -l max_new_tokens
-python generate.py /dev/shm/gpt-oss-20b/ -p ../data/input.txt -l 2048 
+python generate.py /dev/shm/gpt-oss-20b/ -p ../data/input.txt -l 2048
 ```
 
 - To evaluate

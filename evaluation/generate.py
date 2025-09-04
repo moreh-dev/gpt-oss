@@ -1,9 +1,11 @@
 import argparse
-import torch
 import pathlib
+
+import torch
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
 from transformers import TextStreamer
+
 
 def parseArgs():
     parser = argparse.ArgumentParser(description="Text generation example")
@@ -46,10 +48,15 @@ def generate(prompt_path, model, tokenizer, limit):
         # Skip the first line, it is the prompt count
         next(f_prompts)
         for i, prompt in enumerate(f_prompts):
-            enc = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+            enc = tokenizer(prompt,
+                            return_tensors="pt",
+                            add_special_tokens=False)
             input_ids = enc.input_ids
-            attention_mask = enc.attention_mask if "attention_mask" in enc else torch.ones_like(input_ids)
-            streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+            attention_mask = enc.attention_mask if "attention_mask" in enc else torch.ones_like(
+                input_ids)
+            streamer = TextStreamer(tokenizer,
+                                    skip_prompt=True,
+                                    skip_special_tokens=True)
             print(f"\nPROCESSING PROMPT {i}\n")
             with torch.no_grad():
                 output_ids = model.generate(
@@ -61,17 +68,18 @@ def generate(prompt_path, model, tokenizer, limit):
                     use_cache=True,
                     streamer=streamer,
                     eos_token_id=tokenizer.eos_token_id,
-					pad_token_id=tokenizer.pad_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
                 )
-            f_refs.write(" ".join(map(str, output_ids.squeeze(0).tolist())) + "\n")
-            
+            f_refs.write(" ".join(map(str,
+                                      output_ids.squeeze(0).tolist())) + "\n")
+
 
 if __name__ == "__main__":
     args = parseArgs()
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
     model = AutoModelForCausalLM.from_pretrained(
         args.checkpoint,
         device_map="auto",
@@ -87,4 +95,3 @@ if __name__ == "__main__":
         print(f"[ERROR] {args.dtype} is not supported, try fp32 or bf16")
     print(model.dtype)
     generate(args.prompt, model, tokenizer, args.limit)
-    
