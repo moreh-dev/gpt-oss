@@ -1,4 +1,3 @@
-# Dataset Format (`.jsonl`)
 
 - To generate references
 

@@ -159,6 +159,7 @@ def eval_reference_based(ids: List[str], refs: List[Dict], subm: List[Dict]):
                         lang="en",
                         model_type="microsoft/deberta-xlarge-mnli",
                         batch_size=4)
+
     d1 = [distinct_n(p, 1) for p in preds_completion]
     d2 = [distinct_n(p, 2) for p in preds_completion]
     rep = [repetition_rate(p) for p in preds_completion]
@@ -209,6 +210,7 @@ def main():
     if not validate_references(
             refs, pathlib.Path("schema.json")) or not validate_references(
                 subm, pathlib.Path("schema.json")):
+
         print("Exiting due to schema validation failure.")
         return
     # coverage report
