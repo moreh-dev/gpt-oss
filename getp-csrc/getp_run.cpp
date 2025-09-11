@@ -62,7 +62,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   safe_printf(first_piece);
   fflush(stdout);
 
-  while (pos < steps) {
+  while (pos + 1 < steps) {
 
     // forward the transformer to get logits for the next token
     float *logits = forward(transformer, token, pos);
