@@ -19,11 +19,13 @@ void build_requests(Requests *reqs, int num_reqs, int max_token_len,
   reqs->num_reqs = num_reqs;
   reqs->max_token_len = max_token_len;
   reqs->max_seq_len = max_seq_len;
-  reqs->str_reqs = (char *)calloc(num_reqs * max_token_len * (max_seq_len + 1),
-                                  sizeof(char));
-  reqs->tok_gens = (int *)calloc(num_reqs * (max_seq_len + 1), sizeof(int));
-  printf("requests size = %lu B\n",
-         ((num_reqs * max_token_len * (max_seq_len + 1) * sizeof(char)) * 2));
+  reqs->str_reqs = (char *)calloc(
+      1ll * num_reqs * max_token_len * (max_seq_len + 1), sizeof(char));
+  reqs->tok_gens =
+      (int *)calloc(1ll * num_reqs * (max_seq_len + 1), sizeof(int));
+  printf("requests size = %llu B\n",
+         ((1ll * num_reqs * max_token_len * (max_seq_len + 1) * sizeof(char)) *
+          2));
   fflush(stdout);
 }
 
@@ -33,11 +35,12 @@ void free_requests(Requests *reqs) {
 }
 
 char *get_str_req_ptr(Requests *reqs, int idx) {
-  return reqs->str_reqs + idx * reqs->max_token_len * (reqs->max_seq_len + 1);
+  return reqs->str_reqs +
+         1ll * idx * reqs->max_token_len * (reqs->max_seq_len + 1);
 }
 
 int *get_tok_gen_ptr(Requests *reqs, int idx) {
-  return reqs->tok_gens + idx * (reqs->max_seq_len + 1);
+  return reqs->tok_gens + 1ll * idx * (reqs->max_seq_len + 1);
 }
 
 int read_inputfile(const char *input_filename, int max_token_len,
